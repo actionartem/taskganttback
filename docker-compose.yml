@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: tasktracker-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: taskuser
+      POSTGRES_PASSWORD: taskpass
+      POSTGRES_DB: taskdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: tasktracker-pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmindata:/var/lib/pgadmin
+
+  api:
+    build: ./api
+    container_name: tasktracker-api
+    restart: always
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: taskuser
+      DB_PASSWORD: taskpass
+      DB_NAME: taskdb
+      PORT: 3000
+      TELEGRAM_BOT_TOKEN: 8283458875:AAFLhsNJkbM4NITPOpbqFkhoGoUWEFo4lRI
+      TELEGRAM_BOT_USERNAME: Simpletasktracker_bot
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+
+volumes:
+  pgdata:
+  pgadmindata:
