@@ -476,6 +476,28 @@ app.post("/tasks", async (req, res) => {
   }
 });
 
+// ================== Task history ==================
+app.get("/tasks/:id/history", async (req, res) => {
+  const taskId = Number(req.params.id);
+  if (!taskId) return res.status(400).json({ error: "invalid task id" });
+
+  try {
+    const r = await pool.query(
+      `SELECT field_name, old_value, new_value, changed_at
+       FROM task_change_log
+       WHERE task_id = $1
+       ORDER BY changed_at DESC, id DESC`,
+      [taskId]
+    );
+
+    res.json(r.rows);
+  } catch (e) {
+    console.error("GET /tasks/:id/history error:", e);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+
 app.patch("/tasks/:id", async (req, res) => {
   const taskId = Number(req.params.id);
   const {
@@ -530,6 +552,37 @@ app.patch("/tasks/:id", async (req, res) => {
     );
 
     const after = upd.rows[0];
+    // ==== log changes: status / start_at / due_at ====
+    const asIso = (v) => {
+      if (v == null) return null;
+      const d = v instanceof Date ? v : new Date(v);
+      return d.toISOString();
+    };
+
+    const beforeStart = asIso(before.start_at);
+    const afterStart = asIso(after.start_at);
+    const beforeDue = asIso(before.due_at);
+    const afterDue = asIso(after.due_at);
+
+    const changes = [];
+    if (before.status !== after.status) {
+      changes.push(["status", toStr(before.status), toStr(after.status)]);
+    }
+    if (beforeStart !== afterStart) {
+      changes.push(["start_at", beforeStart, afterStart]);
+    }
+    if (beforeDue !== afterDue) {
+      changes.push(["due_at", beforeDue, afterDue]);
+    }
+
+    for (const [field, oldVal, newVal] of changes) {
+      await pool.query(
+        `INSERT INTO task_change_log (task_id, field_name, old_value, new_value)
+         VALUES ($1, $2, $3, $4)`,
+        [taskId, field, oldVal, newVal]
+      );
+    }
+
 
     if (assignee_user_id && assignee_user_id !== before.assignee_user_id) {
       await notifyAssignee(assignee_user_id, `📌 Вам назначена задача #${taskId}: ${after.title}`);
