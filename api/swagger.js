@@ -347,7 +347,7 @@ export function setupSwagger(app) {
               },
             },
             responses: {
-              202: {
+              200: {
                 description: "Выгрузка запущена",
                 content: { "application/json": { schema: { $ref: "#/components/schemas/TaskExportJob" } } },
               },

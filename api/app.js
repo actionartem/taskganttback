@@ -1023,7 +1023,7 @@ app.post("/exports/tasks", requireUser, async (req, res) => {
   taskExportJobs.set(job.id, job);
   setImmediate(() => runTaskExportJob(job.id));
 
-  res.status(202).json(serializeTaskExportJob(job));
+  res.json(serializeTaskExportJob(job));
 });
 
 app.get("/exports/tasks/:jobId", requireUser, async (req, res) => {
