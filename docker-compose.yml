@@ -33,6 +33,26 @@ services:
     volumes:
       - pgadmindata:/var/lib/pgadmin
 
+  db-backup:
+    image: postgres:16
+    container_name: tasktracker-db-backup
+    restart: always
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskuser}
+      POSTGRES_DB: ${POSTGRES_DB:-taskdb}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      BACKUP_INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - pgbackups:/backups
+      - ./scripts/backup-postgres.sh:/usr/local/bin/backup-postgres.sh:ro
+    command: ["sh", "/usr/local/bin/backup-postgres.sh"]
+
   api:
     build: ./api
     container_name: tasktracker-api
@@ -62,3 +82,4 @@ services:
 volumes:
   pgdata:
   pgadmindata:
+  pgbackups:
