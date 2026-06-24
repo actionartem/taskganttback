@@ -60,6 +60,9 @@ jobs:
               docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
                 -c "INSERT INTO schema_migrations (name) VALUES ('$name')"
             done
-            docker compose up -d --build
+            docker compose up -d --build --force-recreate api
+            docker compose exec -T api sh -lc "grep -q approved_hours /app/app.js && grep -q approved_hours /app/swagger.js"
+            docker compose exec -T db psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+              -c "SELECT column_name FROM information_schema.columns WHERE table_name = 'tasks' AND column_name IN ('approved_hours', 'spent_hours') ORDER BY column_name"
             docker image prune -f
           SSH
