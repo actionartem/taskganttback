@@ -79,13 +79,17 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-https://simpletracker.ru,https://www.simpletracker.ru}
       ALLOW_PUBLIC_REGISTRATION: ${ALLOW_PUBLIC_REGISTRATION:-false}
       ALLOW_PASSWORDLESS_LOGIN: ${ALLOW_PASSWORDLESS_LOGIN:-false}
+      TASK_EXPORT_DIR: ${TASK_EXPORT_DIR:-/app/exports}
     ports:
       - "127.0.0.1:${API_PORT:-3000}:3000"
     depends_on:
       db:
         condition: service_healthy
+    volumes:
+      - taskexports:/app/exports
 
 volumes:
   pgdata:
   pgadmindata:
   pgbackups:
+  taskexports:

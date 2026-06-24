@@ -4,6 +4,9 @@ import express from "express";
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
 import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
+import ExcelJS from "exceljs";
 
 const { Pool } = pkg;
 const app = express();
@@ -30,7 +33,9 @@ const ALLOW_PASSWORDLESS_LOGIN = process.env.ALLOW_PASSWORDLESS_LOGIN === "true"
 const ALLOW_PUBLIC_REGISTRATION = process.env.ALLOW_PUBLIC_REGISTRATION === "true";
 const AUTH_RATE_LIMIT_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 60 * 1000);
 const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX || 10);
+const TASK_EXPORT_DIR = process.env.TASK_EXPORT_DIR || path.join(process.cwd(), "exports");
 const authRateBuckets = new Map();
+const taskExportJobs = new Map();
 
 // ================== DB ==================
 const pool = new Pool({
@@ -93,6 +98,94 @@ function statusFilterValues(value) {
   const values = new Set([normalized, value]);
   if (STATUS_UI_TO_API_LEGACY[normalized]) values.add(STATUS_UI_TO_API_LEGACY[normalized]);
   return Array.from(values);
+}
+
+const TASK_EXPORT_STATUSES = [
+  "не в работе",
+  "в аналитике",
+  "на согласовании",
+  "оценка",
+  "ревью",
+  "готова к разработке",
+  "разработка",
+  "завершена",
+];
+
+const PRIORITY_EXPORT_LABELS = {
+  low: "низкий",
+  medium: "средний",
+  high: "высокий",
+};
+
+const TASK_EXPORT_FIELDS = [
+  { key: "id", label: "ID", width: 10, type: "number" },
+  { key: "title", label: "Название", width: 34, type: "text" },
+  { key: "status", label: "Статус", width: 22, type: "text" },
+  { key: "priority", label: "Приоритет", width: 14, type: "text" },
+  { key: "assignee", label: "Исполнитель", width: 22, type: "text" },
+  { key: "approved_hours", label: "Согласовано часов", width: 18, type: "number" },
+  { key: "spent_hours", label: "Затрачено часов", width: 18, type: "number" },
+  { key: "link_url", label: "Ссылка на задачу в JIRA", width: 42, type: "link" },
+  { key: "start_at", label: "Дата начала", width: 14, type: "date" },
+  { key: "due_at", label: "Дата окончания", width: 16, type: "date" },
+  { key: "tags", label: "Теги", width: 26, type: "text" },
+  { key: "description", label: "Описание", width: 48, type: "text" },
+];
+
+const TASK_EXPORT_FIELD_MAP = new Map(TASK_EXPORT_FIELDS.map((field) => [field.key, field]));
+const TASK_EXPORT_STATUS_SET = new Set(TASK_EXPORT_STATUSES);
+
+function normalizeExportStatuses(statuses) {
+  if (!Array.isArray(statuses)) return [];
+  return statuses
+    .map((status) => normalizeStatus(status))
+    .filter((status) => status && TASK_EXPORT_STATUS_SET.has(status));
+}
+
+function normalizeExportFields(fields) {
+  if (!Array.isArray(fields)) return [];
+  return fields
+    .map((field) => String(field || "").trim())
+    .filter((field, index, array) => TASK_EXPORT_FIELD_MAP.has(field) && array.indexOf(field) === index);
+}
+
+function serializeTaskExportJob(job) {
+  return {
+    id: job.id,
+    status: job.status,
+    progress: job.progress,
+    fileName: job.fileName || null,
+    downloadUrl: job.status === "done" ? `/exports/tasks/${job.id}/download` : null,
+    error: job.error || null,
+  };
+}
+
+function setTaskExportProgress(job, progress) {
+  job.progress = Math.max(job.progress || 0, Math.min(100, Math.round(progress)));
+  job.updatedAt = new Date();
+}
+
+function asExportDate(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date;
+}
+
+function getTaskExportValue(row, fieldKey, tagMap) {
+  if (fieldKey === "id") return Number(row.id);
+  if (fieldKey === "title") return row.title || "";
+  if (fieldKey === "description") return row.description || "";
+  if (fieldKey === "status") return normalizeStatus(row.status) || "";
+  if (fieldKey === "priority") return PRIORITY_EXPORT_LABELS[row.priority] || row.priority || "";
+  if (fieldKey === "assignee") return row.assignee_name || "";
+  if (fieldKey === "approved_hours") return toNullableNumber(row.approved_hours);
+  if (fieldKey === "spent_hours") return toNullableNumber(row.spent_hours);
+  if (fieldKey === "link_url") return row.link_url || "";
+  if (fieldKey === "start_at") return asExportDate(row.start_at);
+  if (fieldKey === "due_at") return asExportDate(row.due_at);
+  if (fieldKey === "tags") return (tagMap[row.id] || []).map((tag) => tag.title).join(", ");
+  return "";
 }
 
 function safeEqual(a, b) {
@@ -316,6 +409,160 @@ async function notifyAssignee(userId, text) {
     await sendTelegramMessage(tg, text);
   } catch (e) {
     console.error("notifyAssignee error:", e);
+  }
+}
+
+async function fetchTasksForExport(statuses) {
+  const statusValues = Array.from(new Set(statuses.flatMap((status) => statusFilterValues(status))));
+
+  const tasksRes = await pool.query(
+    `
+    SELECT
+      t.id, t.title, t.description, t.status, t.priority,
+      t.assignee_user_id, t.start_at, t.due_at, t.link_url,
+      t.approved_hours, t.spent_hours,
+      t.created_at, t.updated_at,
+      u.name AS assignee_name, u.role_text AS assignee_role
+    FROM tasks t
+    LEFT JOIN users u ON t.assignee_user_id = u.id
+    WHERE t.status = ANY($1)
+    ORDER BY t.id ASC
+    `,
+    [statusValues]
+  );
+
+  const taskIds = tasksRes.rows.map((row) => row.id);
+  const tagMap = {};
+  if (taskIds.length > 0) {
+    const tagRows = await pool.query(
+      `SELECT tt.task_id, tg.id, tg.title, tg.color
+       FROM task_tags tt JOIN tags tg ON tg.id = tt.tag_id
+       WHERE tt.task_id = ANY($1)
+       ORDER BY tg.title ASC`,
+      [taskIds]
+    );
+
+    taskIds.forEach((id) => {
+      tagMap[id] = [];
+    });
+    tagRows.rows.forEach((row) => {
+      tagMap[row.task_id].push({ id: row.id, title: row.title, color: row.color });
+    });
+  }
+
+  return { rows: tasksRes.rows, tagMap };
+}
+
+function applyTaskExportWorksheetStyle(worksheet, selectedFields, rowsCount) {
+  worksheet.views = [{ state: "frozen", ySplit: 1 }];
+  worksheet.autoFilter = {
+    from: { row: 1, column: 1 },
+    to: { row: 1, column: selectedFields.length },
+  };
+
+  selectedFields.forEach((field, index) => {
+    const column = worksheet.getColumn(index + 1);
+    column.width = field.width;
+    if (field.type === "date") column.numFmt = "yyyy-mm-dd";
+    if (field.type === "number" && field.key !== "id") column.numFmt = "0.##";
+  });
+
+  const header = worksheet.getRow(1);
+  header.height = 24;
+  header.eachCell((cell) => {
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: "FF0F766E" },
+    };
+    cell.border = {
+      top: { style: "thin", color: { argb: "FFCBD5E1" } },
+      left: { style: "thin", color: { argb: "FFCBD5E1" } },
+      bottom: { style: "thin", color: { argb: "FFCBD5E1" } },
+      right: { style: "thin", color: { argb: "FFCBD5E1" } },
+    };
+  });
+
+  for (let rowNumber = 2; rowNumber <= rowsCount + 1; rowNumber += 1) {
+    const row = worksheet.getRow(rowNumber);
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.alignment = { vertical: "top", wrapText: true };
+      cell.border = {
+        top: { style: "thin", color: { argb: "FFE2E8F0" } },
+        left: { style: "thin", color: { argb: "FFE2E8F0" } },
+        bottom: { style: "thin", color: { argb: "FFE2E8F0" } },
+        right: { style: "thin", color: { argb: "FFE2E8F0" } },
+      };
+      if (rowNumber % 2 === 0) {
+        cell.fill = {
+          type: "pattern",
+          pattern: "solid",
+          fgColor: { argb: "FFF8FAFC" },
+        };
+      }
+    });
+  }
+}
+
+async function runTaskExportJob(jobId) {
+  const job = taskExportJobs.get(jobId);
+  if (!job) return;
+
+  try {
+    job.status = "running";
+    setTaskExportProgress(job, 5);
+    await fs.mkdir(TASK_EXPORT_DIR, { recursive: true });
+
+    setTaskExportProgress(job, 18);
+    const { rows, tagMap } = await fetchTasksForExport(job.statuses);
+    setTaskExportProgress(job, 35);
+
+    const selectedFields = job.fields.map((fieldKey) => TASK_EXPORT_FIELD_MAP.get(fieldKey));
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = "SimpleTracker";
+    workbook.created = new Date();
+    workbook.modified = new Date();
+
+    const worksheet = workbook.addWorksheet("Задачи", {
+      properties: { defaultRowHeight: 20 },
+      pageSetup: { orientation: "landscape", fitToPage: true, fitToWidth: 1 },
+    });
+    worksheet.addRow(selectedFields.map((field) => field.label));
+
+    const linkColumnIndex = selectedFields.findIndex((field) => field.key === "link_url") + 1;
+    rows.forEach((task, index) => {
+      const values = selectedFields.map((field) => getTaskExportValue(task, field.key, tagMap));
+      const row = worksheet.addRow(values);
+      if (linkColumnIndex > 0 && task.link_url) {
+        const cell = row.getCell(linkColumnIndex);
+        cell.value = { text: task.link_url, hyperlink: task.link_url };
+        cell.font = { color: { argb: "FF2563EB" }, underline: true };
+      }
+
+      const progressStep = rows.length > 0 ? ((index + 1) / rows.length) * 45 : 45;
+      setTaskExportProgress(job, 35 + progressStep);
+    });
+
+    applyTaskExportWorksheetStyle(worksheet, selectedFields, rows.length);
+    setTaskExportProgress(job, 88);
+
+    const safeTimestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const fileName = `simpletracker-tasks-${safeTimestamp}-${job.id.slice(0, 8)}.xlsx`;
+    const filePath = path.join(TASK_EXPORT_DIR, fileName);
+
+    await workbook.xlsx.writeFile(filePath);
+
+    job.status = "done";
+    job.fileName = fileName;
+    job.filePath = filePath;
+    setTaskExportProgress(job, 100);
+  } catch (e) {
+    console.error("task export error:", e);
+    job.status = "error";
+    job.error = "Произошла ошибка выгрузки, повторите еще раз";
+    setTaskExportProgress(job, 100);
   }
 }
 
@@ -744,6 +991,66 @@ app.get("/tasks", requireAuth, async (req, res) => {
   } catch (e) {
     console.error("GET /tasks error:", e);
     res.status(500).json({ error: "db error" });
+  }
+});
+
+// ================== Task exports ==================
+app.post("/exports/tasks", requireUser, async (req, res) => {
+  const statuses = normalizeExportStatuses(req.body?.statuses);
+  const fields = normalizeExportFields(req.body?.fields);
+
+  if (statuses.length === 0) {
+    return res.status(400).json({ error: "select at least one status" });
+  }
+  if (fields.length === 0) {
+    return res.status(400).json({ error: "select at least one field" });
+  }
+
+  const job = {
+    id: crypto.randomUUID(),
+    ownerId: req.user.id,
+    statuses,
+    fields,
+    status: "queued",
+    progress: 0,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    fileName: null,
+    filePath: null,
+    error: null,
+  };
+
+  taskExportJobs.set(job.id, job);
+  setImmediate(() => runTaskExportJob(job.id));
+
+  res.status(202).json(serializeTaskExportJob(job));
+});
+
+app.get("/exports/tasks/:jobId", requireUser, async (req, res) => {
+  const job = taskExportJobs.get(req.params.jobId);
+  if (!job || job.ownerId !== req.user.id) {
+    return res.status(404).json({ error: "export not found" });
+  }
+
+  res.json(serializeTaskExportJob(job));
+});
+
+app.get("/exports/tasks/:jobId/download", requireUser, async (req, res) => {
+  const job = taskExportJobs.get(req.params.jobId);
+  if (!job || job.ownerId !== req.user.id || job.status !== "done" || !job.filePath) {
+    return res.status(404).json({ error: "export not found" });
+  }
+
+  try {
+    await fs.access(job.filePath);
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    return res.download(job.filePath, job.fileName || "simpletracker-tasks.xlsx");
+  } catch (e) {
+    console.error("task export download error:", e);
+    return res.status(404).json({ error: "export file not found" });
   }
 });
 

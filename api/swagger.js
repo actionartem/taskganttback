@@ -93,6 +93,47 @@ export function setupSwagger(app) {
               spent_hours: { type: "number", nullable: true },
             },
           },
+          TaskExportRequest: {
+            type: "object",
+            required: ["statuses", "fields"],
+            properties: {
+              statuses: {
+                type: "array",
+                items: { type: "string" },
+              },
+              fields: {
+                type: "array",
+                items: {
+                  type: "string",
+                  enum: [
+                    "id",
+                    "title",
+                    "status",
+                    "priority",
+                    "assignee",
+                    "approved_hours",
+                    "spent_hours",
+                    "link_url",
+                    "start_at",
+                    "due_at",
+                    "tags",
+                    "description",
+                  ],
+                },
+              },
+            },
+          },
+          TaskExportJob: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              status: { type: "string", enum: ["queued", "running", "done", "error"] },
+              progress: { type: "integer", minimum: 0, maximum: 100 },
+              fileName: { type: "string", nullable: true },
+              downloadUrl: { type: "string", nullable: true },
+              error: { type: "string", nullable: true },
+            },
+          },
           Error: {
             type: "object",
             properties: {
@@ -291,6 +332,59 @@ export function setupSwagger(app) {
             security: authSecurity,
             parameters: [{ name: "tagId", in: "path", required: true, schema: { type: "integer" } }],
             responses: { 200: { description: "OK" } },
+          },
+        },
+        "/exports/tasks": {
+          post: {
+            summary: "Запустить выгрузку задач в Excel",
+            security: authSecurity,
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/TaskExportRequest" },
+                },
+              },
+            },
+            responses: {
+              202: {
+                description: "Выгрузка запущена",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/TaskExportJob" } } },
+              },
+              400: { description: "Не выбраны статусы или поля" },
+            },
+          },
+        },
+        "/exports/tasks/{jobId}": {
+          get: {
+            summary: "Получить прогресс выгрузки задач",
+            security: authSecurity,
+            parameters: [{ name: "jobId", in: "path", required: true, schema: { type: "string" } }],
+            responses: {
+              200: {
+                description: "OK",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/TaskExportJob" } } },
+              },
+              404: { description: "Выгрузка не найдена" },
+            },
+          },
+        },
+        "/exports/tasks/{jobId}/download": {
+          get: {
+            summary: "Скачать готовый Excel-файл задач",
+            security: authSecurity,
+            parameters: [{ name: "jobId", in: "path", required: true, schema: { type: "string" } }],
+            responses: {
+              200: {
+                description: "Excel-файл",
+                content: {
+                  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                    schema: { type: "string", format: "binary" },
+                  },
+                },
+              },
+              404: { description: "Выгрузка или файл не найдены" },
+            },
           },
         },
         "/tasks": {
