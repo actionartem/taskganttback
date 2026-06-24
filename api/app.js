@@ -13,15 +13,14 @@ app.use(express.json());
 // ================== CONFIG ==================
 const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN ||
-  process.env.TG_BOT_TOKEN ||
-  "8283458875:AAFLhsNJkbM4NITPOpbqFkhoGoUWEFo4lRI";
+  process.env.TG_BOT_TOKEN;
 
 // ================== DB ==================
 const pool = new Pool({
   host: process.env.DB_HOST || "db",
   port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432,
   user: process.env.DB_USER || "taskuser",
-  password: process.env.DB_PASSWORD || "taskpass",
+  password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME || "taskdb",
 });
 
@@ -31,7 +30,7 @@ const toInt = (v) => (v == null || v === "" ? null : Number(v));
 
 // ================== Telegram ==================
 async function sendTelegramMessage(chatId, text) {
-  if (!chatId) return;
+  if (!chatId || !TELEGRAM_BOT_TOKEN) return;
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
