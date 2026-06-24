@@ -1,0 +1,60 @@
+name: Backfill approved hours
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Set true to update production data. False runs dry-run only."
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Backfill approved hours from descriptions
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -p "$DEPLOY_PORT" -o StrictHostKeyChecking=accept-new "$DEPLOY_USER@$DEPLOY_HOST" "APPLY=$APPLY bash -s" <<'SSH'
+            set -euo pipefail
+            cd /srv/tasktracker
+            git fetch origin main
+            git reset --hard origin/main
+            docker compose up -d db </dev/null
+            set -a
+            . ./.env
+            set +a
+            POSTGRES_USER="${POSTGRES_USER:-taskuser}"
+            POSTGRES_DB="${POSTGRES_DB:-taskdb}"
+
+            if [ "$APPLY" = "true" ]; then
+              backup_dir="/srv/tasktracker/manual-backups"
+              mkdir -p "$backup_dir"
+              backup_file="$backup_dir/pre-approved-hours-backfill-$(date +%Y%m%d-%H%M%S).dump"
+              docker compose exec -T db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc </dev/null > "$backup_file"
+            fi
+
+            docker compose exec -T db psql \
+              -v ON_ERROR_STOP=1 \
+              -v apply="$APPLY" \
+              -U "$POSTGRES_USER" \
+              -d "$POSTGRES_DB" \
+              < scripts/backfill-approved-hours-from-description.psql
+          SSH

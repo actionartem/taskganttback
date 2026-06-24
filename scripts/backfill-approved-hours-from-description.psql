@@ -1,0 +1,54 @@
+\pset pager off
+\set ON_ERROR_STOP on
+
+BEGIN;
+
+CREATE TEMP TABLE tmp_approved_hours_backfill ON COMMIT DROP AS
+WITH normalized AS (
+  SELECT
+    id,
+    regexp_replace(replace(coalesce(description, ''), ',', '.'), '[[:space:]]+', ' ', 'g') AS description_text
+  FROM tasks
+  WHERE approved_hours IS NULL
+    AND description IS NOT NULL
+    AND btrim(description) <> ''
+),
+parsed AS (
+  SELECT
+    id,
+    COALESCE(
+      substring(description_text FROM '(?i)(?:согласован[[:alpha:]]*|approved)[^0-9]{0,40}([0-9]+(?:\.[0-9]+)?)'),
+      substring(description_text FROM '(?i)([0-9]+(?:\.[0-9]+)?)[[:space:]]*(?:ч\.?|час(?:а|ов)?)(?:[^[:alpha:]]|$)'),
+      substring(description_text FROM '(?i)(?:час(?:а|ов)?|ч\.?)[[:space:]]*(?:согласован[[:alpha:]]*)?[[:space:]]*[-:=]?[[:space:]]*([0-9]+(?:\.[0-9]+)?)'),
+      substring(description_text FROM '^[[:space:]]*([0-9]+(?:\.[0-9]+)?)[[:space:]]*$')
+    ) AS raw_hours
+  FROM normalized
+)
+SELECT
+  id,
+  raw_hours::numeric(10, 2) AS parsed_hours
+FROM parsed
+WHERE raw_hours IS NOT NULL
+  AND raw_hours::numeric >= 0
+  AND raw_hours::numeric <= 10000;
+
+SELECT count(*) AS candidate_count
+FROM tmp_approved_hours_backfill;
+
+SELECT id, parsed_hours
+FROM tmp_approved_hours_backfill
+ORDER BY id;
+
+\if :apply
+UPDATE tasks AS t
+SET approved_hours = b.parsed_hours,
+    updated_at = NOW()
+FROM tmp_approved_hours_backfill AS b
+WHERE t.id = b.id
+RETURNING t.id, t.approved_hours;
+
+COMMIT;
+\else
+\echo 'Dry run only: no rows changed.'
+ROLLBACK;
+\endif
