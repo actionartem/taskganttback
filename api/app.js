@@ -27,6 +27,42 @@ const pool = new Pool({
 // ===== helpers =====
 const toStr = (v) => (typeof v === "string" ? v : v == null ? null : String(v));
 const toInt = (v) => (v == null || v === "" ? null : Number(v));
+const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+const STATUS_API_TO_UI = {
+  new: "не в работе",
+  in_progress: "разработка",
+  done: "завершена",
+  review: "ревью",
+};
+
+const STATUS_UI_TO_API_LEGACY = {
+  "не в работе": "new",
+  разработка: "in_progress",
+  завершена: "done",
+  ревью: "review",
+};
+
+function cleanNullableText(value) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text === "" ? null : text;
+}
+
+function normalizeStatus(value) {
+  const text = cleanNullableText(value);
+  if (!text) return null;
+  const lower = text.toLowerCase();
+  return STATUS_API_TO_UI[lower] || lower;
+}
+
+function statusFilterValues(value) {
+  const normalized = normalizeStatus(value);
+  if (!normalized) return [];
+  const values = new Set([normalized, value]);
+  if (STATUS_UI_TO_API_LEGACY[normalized]) values.add(STATUS_UI_TO_API_LEGACY[normalized]);
+  return Array.from(values);
+}
 
 // ================== Telegram ==================
 async function sendTelegramMessage(chatId, text) {
@@ -265,15 +301,33 @@ app.patch("/users/:id", async (req, res) => {
 
 app.delete("/users/:id", async (req, res) => {
   const userId = Number(req.params.id);
+  const client = await pool.connect();
   try {
-    const check = await pool.query(`SELECT is_superadmin FROM users WHERE id=$1`, [userId]);
-    if (check.rowCount > 0 && check.rows[0].is_superadmin)
+    await client.query("BEGIN");
+
+    const check = await client.query(`SELECT is_superadmin FROM users WHERE id=$1 FOR UPDATE`, [userId]);
+    if (check.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "user not found" });
+    }
+
+    if (check.rows[0].is_superadmin) {
+      await client.query("ROLLBACK");
       return res.status(403).json({ error: "cannot delete superadmin" });
-    await pool.query(`DELETE FROM users WHERE id=$1`, [userId]);
+    }
+
+    await client.query(`UPDATE tasks SET created_by = NULL WHERE created_by = $1`, [userId]);
+    await client.query(`UPDATE tasks SET updated_by = NULL WHERE updated_by = $1`, [userId]);
+    await client.query(`DELETE FROM users WHERE id=$1`, [userId]);
+    await client.query("COMMIT");
+
     res.json({ ok: true });
   } catch (e) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("DELETE /users/:id error:", e);
     res.status(500).json({ error: "db error" });
+  } finally {
+    client.release();
   }
 });
 
@@ -329,7 +383,7 @@ app.get("/tasks", async (req, res) => {
     let idx = 1;
 
     if (assigneeId) { where += ` AND t.assignee_user_id = $${idx++}`; params.push(assigneeId); }
-    if (status)     { where += ` AND t.status = $${idx++}`;           params.push(status); }
+    if (status)     { where += ` AND t.status = ANY($${idx++})`;      params.push(statusFilterValues(status)); }
     if (priority)   { where += ` AND t.priority = $${idx++}`;         params.push(priority); }
     if (search)     { where += ` AND (t.title ILIKE $${idx} OR t.description ILIKE $${idx})`; params.push(`%${search}%`); idx++; }
     if (tagId) {
@@ -371,7 +425,7 @@ app.get("/tasks", async (req, res) => {
       id: row.id,
       title: row.title,
       description: row.description,
-      status: row.status,
+      status: normalizeStatus(row.status),
       priority: row.priority,
       assignee_user_id: row.assignee_user_id,
       start_at: row.start_at,
@@ -423,20 +477,20 @@ app.post("/tasks", async (req, res) => {
            created_by, updated_by, priority, status)
         VALUES
           ($1, $2, $3, $4, $5, $6, $7,
-           $8, $8, COALESCE($9,'low'), COALESCE($10,'new'))
+           $8, $8, COALESCE($9,'low'), COALESCE($10,'не в работе'))
         RETURNING id
       `;
       params = [
         idProvided,
         title,
-        description || null,
+        cleanNullableText(description),
         toInt(assignee_user_id),
         start_at || null,
         due_at || null,
-        link_url || null,
+        cleanNullableText(link_url),
         toInt(created_by),
         priority || null,
-        status || null,
+        normalizeStatus(status) || "не в работе",
       ];
     } else {
       sql = `
@@ -445,19 +499,19 @@ app.post("/tasks", async (req, res) => {
            created_by, updated_by, priority, status)
         VALUES
           ($1, $2, $3, $4, $5, $6,
-           $7, $7, COALESCE($8,'low'), COALESCE($9,'new'))
+           $7, $7, COALESCE($8,'low'), COALESCE($9,'не в работе'))
         RETURNING id
       `;
       params = [
         title,
-        description || null,
+        cleanNullableText(description),
         toInt(assignee_user_id),
         start_at || null,
         due_at || null,
-        link_url || null,
+        cleanNullableText(link_url),
         toInt(created_by),
         priority || null,
-        status || null,
+        normalizeStatus(status) || "не в работе",
       ];
     }
 
@@ -499,6 +553,7 @@ app.get("/tasks/:id/history", async (req, res) => {
 
 app.patch("/tasks/:id", async (req, res) => {
   const taskId = Number(req.params.id);
+  const body = req.body || {};
   const {
     title,
     description,
@@ -509,7 +564,7 @@ app.patch("/tasks/:id", async (req, res) => {
     link_url,
     priority,
     updated_by,
-  } = req.body;
+  } = body;
 
   try {
     const current = await pool.query(
@@ -519,35 +574,42 @@ app.patch("/tasks/:id", async (req, res) => {
     if (current.rowCount === 0) return res.status(404).json({ error: "task not found" });
     const before = current.rows[0];
 
+    const setParts = [];
+    const values = [];
+    const addSet = (field, value) => {
+      values.push(value);
+      setParts.push(`${field} = $${values.length}`);
+    };
+
+    if (hasOwn(body, "title")) {
+      const cleanTitle = cleanNullableText(title);
+      if (!cleanTitle) return res.status(400).json({ error: "title is required" });
+      addSet("title", cleanTitle);
+    }
+    if (hasOwn(body, "description")) addSet("description", cleanNullableText(description));
+    if (hasOwn(body, "status")) addSet("status", normalizeStatus(status) || before.status);
+    if (hasOwn(body, "assignee_user_id")) addSet("assignee_user_id", toInt(assignee_user_id));
+    if (hasOwn(body, "start_at")) addSet("start_at", start_at || null);
+    if (hasOwn(body, "due_at")) addSet("due_at", due_at || null);
+    if (hasOwn(body, "link_url")) addSet("link_url", cleanNullableText(link_url));
+    if (hasOwn(body, "priority")) addSet("priority", cleanNullableText(priority) || before.priority);
+    if (hasOwn(body, "updated_by")) addSet("updated_by", toInt(updated_by));
+
+    if (setParts.length === 0) {
+      return res.json({ ...before, status: normalizeStatus(before.status) });
+    }
+
+    values.push(taskId);
     const upd = await pool.query(
       `
       UPDATE tasks
       SET
-        title = COALESCE($1,title),
-        description = COALESCE($2,description),
-        status = COALESCE($3,status),
-        assignee_user_id = $4,
-        start_at = COALESCE($5,start_at),
-        due_at = COALESCE($6,due_at),
-        link_url = COALESCE($7,link_url),
-        priority = COALESCE($8,priority),
-        updated_by = COALESCE($9,updated_by),
+        ${setParts.join(",\n        ")},
         updated_at = NOW()
-      WHERE id = $10
+      WHERE id = $${values.length}
       RETURNING *
       `,
-      [
-        title || null,
-        description || null,
-        status || null,
-        assignee_user_id === undefined ? before.assignee_user_id : toInt(assignee_user_id),
-        start_at || null,
-        due_at || null,
-        link_url || null,
-        priority || null,
-        toInt(updated_by),
-        taskId,
-      ]
+      values
     );
 
     const after = upd.rows[0];
@@ -562,10 +624,12 @@ app.patch("/tasks/:id", async (req, res) => {
     const afterStart = asIso(after.start_at);
     const beforeDue = asIso(before.due_at);
     const afterDue = asIso(after.due_at);
+    const beforeStatus = normalizeStatus(before.status);
+    const afterStatus = normalizeStatus(after.status);
 
     const changes = [];
-    if (before.status !== after.status) {
-      changes.push(["status", toStr(before.status), toStr(after.status)]);
+    if (beforeStatus !== afterStatus) {
+      changes.push(["status", toStr(beforeStatus), toStr(afterStatus)]);
     }
     if (beforeStart !== afterStart) {
       changes.push(["start_at", beforeStart, afterStart]);
@@ -583,11 +647,12 @@ app.patch("/tasks/:id", async (req, res) => {
     }
 
 
-    if (assignee_user_id && assignee_user_id !== before.assignee_user_id) {
-      await notifyAssignee(assignee_user_id, `📌 Вам назначена задача #${taskId}: ${after.title}`);
+    const nextAssigneeId = toInt(assignee_user_id);
+    if (hasOwn(body, "assignee_user_id") && nextAssigneeId && nextAssigneeId !== before.assignee_user_id) {
+      await notifyAssignee(nextAssigneeId, `📌 Вам назначена задача #${taskId}: ${after.title}`);
     }
 
-    res.json(after);
+    res.json({ ...after, status: normalizeStatus(after.status) });
   } catch (e) {
     console.error("PATCH /tasks/:id error:", e);
     res.status(500).json({ error: "db error" });
