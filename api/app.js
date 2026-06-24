@@ -1,6 +1,7 @@
 // app.js — SimpleTracker API (без "досок" и без истории задач)
 
 import express from "express";
+import cors from "cors";
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
 import crypto from "crypto";
@@ -8,12 +9,38 @@ import crypto from "crypto";
 const { Pool } = pkg;
 const app = express();
 
+const DEFAULT_CORS_ORIGINS = "https://simpletracker.ru,https://www.simpletracker.ru";
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error("not allowed by CORS"));
+  },
+  allowedHeaders: ["Content-Type", "Authorization", "X-Internal-Token"],
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+}));
 app.use(express.json());
 
 // ================== CONFIG ==================
 const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN ||
   process.env.TG_BOT_TOKEN;
+const SESSION_SECRET =
+  process.env.SESSION_SECRET ||
+  process.env.AUTH_SECRET ||
+  process.env.DB_PASSWORD ||
+  TELEGRAM_BOT_TOKEN;
+const INTERNAL_API_TOKEN =
+  process.env.INTERNAL_API_TOKEN ||
+  process.env.BOT_API_TOKEN ||
+  TELEGRAM_BOT_TOKEN;
+const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 30);
+const ALLOW_PASSWORDLESS_LOGIN = process.env.ALLOW_PASSWORDLESS_LOGIN === "true";
+const ALLOW_PUBLIC_REGISTRATION = process.env.ALLOW_PUBLIC_REGISTRATION === "true";
 
 // ================== DB ==================
 const pool = new Pool({
@@ -64,6 +91,122 @@ function statusFilterValues(value) {
   return Array.from(values);
 }
 
+function safeEqual(a, b) {
+  if (!a || !b) return false;
+  const left = Buffer.from(String(a));
+  const right = Buffer.from(String(b));
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function base64UrlJson(value) {
+  return base64UrlEncode(JSON.stringify(value));
+}
+
+function signSessionPayload(payloadBase64) {
+  return crypto
+    .createHmac("sha256", SESSION_SECRET)
+    .update(payloadBase64)
+    .digest("base64url");
+}
+
+function createSessionToken(user) {
+  const payload = base64UrlJson({
+    sub: user.id,
+    login: user.login,
+    is_superadmin: !!user.is_superadmin,
+    exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
+  });
+  return `${payload}.${signSessionPayload(payload)}`;
+}
+
+function verifySessionToken(token) {
+  if (!SESSION_SECRET || !token) return null;
+  const parts = String(token).split(".");
+  if (parts.length !== 2) return null;
+  const [payloadBase64, signature] = parts;
+  if (!safeEqual(signSessionPayload(payloadBase64), signature)) return null;
+
+  try {
+    const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
+    if (!payload.sub || !payload.exp || Number(payload.exp) < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function getBearerToken(req) {
+  const header = req.get("authorization") || "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : null;
+}
+
+function withSession(user) {
+  return { ...user, token: createSessionToken(user) };
+}
+
+async function authenticateRequest(req, res, next) {
+  try {
+    const internalToken = req.get("x-internal-token");
+    if (INTERNAL_API_TOKEN && safeEqual(internalToken, INTERNAL_API_TOKEN)) {
+      req.isInternal = true;
+      return next();
+    }
+
+    const payload = verifySessionToken(getBearerToken(req));
+    if (!payload) return res.status(401).json({ error: "unauthorized" });
+
+    const r = await pool.query(
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin
+       FROM users
+       WHERE id=$1 AND COALESCE(is_active, true) = true`,
+      [payload.sub]
+    );
+    if (r.rowCount === 0) return res.status(401).json({ error: "unauthorized" });
+
+    req.user = r.rows[0];
+    req.isInternal = false;
+    return next();
+  } catch (e) {
+    console.error("auth middleware error:", e);
+    return res.status(500).json({ error: "auth error" });
+  }
+}
+
+function requireAuth(req, res, next) {
+  return authenticateRequest(req, res, next);
+}
+
+function requireUser(req, res, next) {
+  return authenticateRequest(req, res, () => {
+    if (!req.user) return res.status(401).json({ error: "unauthorized" });
+    return next();
+  });
+}
+
+function requireSuperadmin(req, res, next) {
+  return authenticateRequest(req, res, () => {
+    if (!req.user?.is_superadmin) return res.status(403).json({ error: "forbidden" });
+    return next();
+  });
+}
+
+function requireInternal(req, res, next) {
+  const internalToken = req.get("x-internal-token");
+  if (!INTERNAL_API_TOKEN || !safeEqual(internalToken, INTERNAL_API_TOKEN)) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  req.isInternal = true;
+  return next();
+}
+
 // ================== Telegram ==================
 async function sendTelegramMessage(chatId, text) {
   if (!chatId || !TELEGRAM_BOT_TOKEN) return;
@@ -99,10 +242,37 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 // ================== Auth ==================
 function hashPassword(pwd) {
-  return crypto.createHash("sha256").update(pwd).digest("hex");
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(String(pwd), salt, 64).toString("hex");
+  return `scrypt:${salt}:${hash}`;
+}
+
+function legacyHashPassword(pwd) {
+  return crypto.createHash("sha256").update(String(pwd)).digest("hex");
+}
+
+function verifyPassword(pwd, storedHash) {
+  if (!storedHash) return false;
+
+  if (storedHash.startsWith("scrypt:")) {
+    const [, salt, expected] = storedHash.split(":");
+    if (!salt || !expected) return false;
+    const actual = crypto.scryptSync(String(pwd), salt, 64).toString("hex");
+    return safeEqual(actual, expected);
+  }
+
+  return safeEqual(legacyHashPassword(pwd), storedHash);
+}
+
+function needsPasswordRehash(storedHash) {
+  return !storedHash || !storedHash.startsWith("scrypt:");
 }
 
 app.post("/auth/login", async (req, res) => {
+  if (!ALLOW_PASSWORDLESS_LOGIN) {
+    return res.status(403).json({ error: "passwordless login is disabled" });
+  }
+
   const { login } = req.body;
   if (!login) return res.status(400).json({ error: "login is required" });
   try {
@@ -112,7 +282,7 @@ app.post("/auth/login", async (req, res) => {
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
     const u = r.rows[0];
-    res.json(u);
+    res.json(withSession(u));
   } catch (e) {
     console.error("auth/login error:", e);
     res.status(500).json({ error: "db error" });
@@ -125,6 +295,12 @@ app.post("/auth/register-password", async (req, res) => {
     return res.status(400).json({ error: "login, password and name are required" });
 
   try {
+    const userCount = await pool.query(`SELECT COUNT(*)::int AS count FROM users`);
+    const isFirstUser = Number(userCount.rows[0]?.count || 0) === 0;
+    if (!ALLOW_PUBLIC_REGISTRATION && !isFirstUser) {
+      return res.status(403).json({ error: "public registration is disabled" });
+    }
+
     const exists = await pool.query(`SELECT id FROM users WHERE login = $1`, [login]);
     if (exists.rowCount > 0) return res.status(400).json({ error: "login already exists" });
 
@@ -134,12 +310,12 @@ app.post("/auth/register-password", async (req, res) => {
       INSERT INTO users
         (login, password_hash, name, role_text, telegram_id, is_superadmin, is_active, first_name, last_name, created_at)
       VALUES
-        ($1, $2, $3, COALESCE($4,''), NULL, false, true, '', '', NOW())
+        ($1, $2, $3, COALESCE($4,''), NULL, $5, true, '', '', NOW())
       RETURNING id, login, name, role_text, telegram_id, is_superadmin
       `,
-      [login, passHash, name, role_text || ""]
+      [login, passHash, name, role_text || "", isFirstUser]
     );
-    res.status(201).json(ins.rows[0]);
+    res.status(201).json(withSession(ins.rows[0]));
   } catch (e) {
     console.error("auth/register-password error:", e);
     res.status(500).json({ error: "db error" });
@@ -156,19 +332,23 @@ app.post("/auth/login-password", async (req, res) => {
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
     const u = r.rows[0];
-    if (hashPassword(password) !== u.password_hash)
+    if (!verifyPassword(password, u.password_hash)) {
       return res.status(401).json({ error: "wrong password" });
+    }
+    if (needsPasswordRehash(u.password_hash)) {
+      await pool.query(`UPDATE users SET password_hash=$1 WHERE id=$2`, [hashPassword(password), u.id]);
+    }
     delete u.password_hash;
-    res.json(u);
+    res.json(withSession(u));
   } catch (e) {
     console.error("auth/login-password error:", e);
     res.status(500).json({ error: "db error" });
   }
 });
 
-// Telegram link/unlink — оставляем как было
-app.post("/auth/telegram/request", async (req, res) => {
-  const { login } = req.body;
+// Telegram link/unlink
+app.post("/auth/telegram/request", requireUser, async (req, res) => {
+  const login = req.user.login;
   if (!login) return res.status(400).json({ error: "login is required" });
 
   const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -197,7 +377,7 @@ app.post("/auth/telegram/request", async (req, res) => {
   }
 });
 
-app.post("/auth/telegram/code-from-bot", async (req, res) => {
+app.post("/auth/telegram/code-from-bot", requireInternal, async (req, res) => {
   const { telegram_id, name, code } = req.body;
   if (!telegram_id || !code)
     return res.status(400).json({ error: "telegram_id and code are required" });
@@ -227,8 +407,9 @@ app.post("/auth/telegram/code-from-bot", async (req, res) => {
 });
 
 // ================== Users ==================
-app.get("/me", async (req, res) => {
-  const id = Number(req.query.user_id || 0);
+app.get("/me", requireUser, async (req, res) => {
+  const requestedId = Number(req.query.user_id || req.user.id);
+  const id = req.user.is_superadmin ? requestedId : req.user.id;
   if (!id) return res.status(400).json({ error: "user_id is required" });
   try {
     const r = await pool.query(
@@ -243,7 +424,7 @@ app.get("/me", async (req, res) => {
   }
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", requireUser, async (req, res) => {
   try {
     const r = await pool.query(
       `SELECT id, login, name, role_text, telegram_id, is_superadmin FROM users ORDER BY id ASC`
@@ -255,7 +436,7 @@ app.get("/users", async (req, res) => {
   }
 });
 
-app.post("/users", async (req, res) => {
+app.post("/users", requireSuperadmin, async (req, res) => {
   const { name, role_text } = req.body;
   if (!name) return res.status(400).json({ error: "name is required" });
 
@@ -276,9 +457,12 @@ app.post("/users", async (req, res) => {
   }
 });
 
-app.patch("/users/:id", async (req, res) => {
+app.patch("/users/:id", requireUser, async (req, res) => {
   const userId = Number(req.params.id);
   const { name, role_text, telegram_id } = req.body;
+  if (!req.user.is_superadmin && req.user.id !== userId) {
+    return res.status(403).json({ error: "forbidden" });
+  }
   try {
     const r = await pool.query(
       `
@@ -299,7 +483,7 @@ app.patch("/users/:id", async (req, res) => {
   }
 });
 
-app.delete("/users/:id", async (req, res) => {
+app.delete("/users/:id", requireSuperadmin, async (req, res) => {
   const userId = Number(req.params.id);
   const client = await pool.connect();
   try {
@@ -332,7 +516,7 @@ app.delete("/users/:id", async (req, res) => {
 });
 
 // ================== Tags (global) ==================
-app.get("/tags", async (req, res) => {
+app.get("/tags", requireUser, async (req, res) => {
   try {
     const r = await pool.query(`SELECT id, title, color FROM tags ORDER BY id ASC`);
     res.json(r.rows);
@@ -342,7 +526,7 @@ app.get("/tags", async (req, res) => {
   }
 });
 
-app.post("/tags", async (req, res) => {
+app.post("/tags", requireUser, async (req, res) => {
   const { title, color } = req.body;
   if (!title) return res.status(400).json({ error: "title is required" });
   try {
@@ -357,7 +541,7 @@ app.post("/tags", async (req, res) => {
   }
 });
 
-app.delete("/tags/:tagId", async (req, res) => {
+app.delete("/tags/:tagId", requireUser, async (req, res) => {
   const tagId = Number(req.params.tagId);
   try {
     await pool.query(`DELETE FROM task_tags WHERE tag_id=$1`, [tagId]);
@@ -370,7 +554,7 @@ app.delete("/tags/:tagId", async (req, res) => {
 });
 
 // ================== Tasks (без досок, без истории) ==================
-app.get("/tasks", async (req, res) => {
+app.get("/tasks", requireAuth, async (req, res) => {
   const assigneeId = req.query.assignee_id ? Number(req.query.assignee_id) : null;
   const status     = req.query.status   ? String(req.query.status)   : null;
   const priority   = req.query.priority ? String(req.query.priority) : null;
@@ -445,7 +629,7 @@ app.get("/tasks", async (req, res) => {
   }
 });
 
-app.post("/tasks", async (req, res) => {
+app.post("/tasks", requireUser, async (req, res) => {
   const {
     id: clientId,            // пользовательский ID (необязателен, но можно передать)
     title,
@@ -462,6 +646,7 @@ app.post("/tasks", async (req, res) => {
   if (!title) return res.status(400).json({ error: "title is required" });
 
   try {
+    const actorId = req.user?.id || toInt(created_by);
     // Если ID передан — проверим уникальность
     const idProvided = toInt(clientId);
     if (idProvided != null) {
@@ -488,7 +673,7 @@ app.post("/tasks", async (req, res) => {
         start_at || null,
         due_at || null,
         cleanNullableText(link_url),
-        toInt(created_by),
+        actorId,
         priority || null,
         normalizeStatus(status) || "не в работе",
       ];
@@ -509,7 +694,7 @@ app.post("/tasks", async (req, res) => {
         start_at || null,
         due_at || null,
         cleanNullableText(link_url),
-        toInt(created_by),
+        actorId,
         priority || null,
         normalizeStatus(status) || "не в работе",
       ];
@@ -530,7 +715,7 @@ app.post("/tasks", async (req, res) => {
 });
 
 // ================== Task history ==================
-app.get("/tasks/:id/history", async (req, res) => {
+app.get("/tasks/:id/history", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
   if (!taskId) return res.status(400).json({ error: "invalid task id" });
 
@@ -551,7 +736,7 @@ app.get("/tasks/:id/history", async (req, res) => {
 });
 
 
-app.patch("/tasks/:id", async (req, res) => {
+app.patch("/tasks/:id", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
   const body = req.body || {};
   const {
@@ -593,12 +778,12 @@ app.patch("/tasks/:id", async (req, res) => {
     if (hasOwn(body, "due_at")) addSet("due_at", due_at || null);
     if (hasOwn(body, "link_url")) addSet("link_url", cleanNullableText(link_url));
     if (hasOwn(body, "priority")) addSet("priority", cleanNullableText(priority) || before.priority);
-    if (hasOwn(body, "updated_by")) addSet("updated_by", toInt(updated_by));
 
     if (setParts.length === 0) {
       return res.json({ ...before, status: normalizeStatus(before.status) });
     }
 
+    addSet("updated_by", req.user.id || toInt(updated_by));
     values.push(taskId);
     const upd = await pool.query(
       `
@@ -659,7 +844,7 @@ app.patch("/tasks/:id", async (req, res) => {
   }
 });
 
-app.delete("/tasks/:id", async (req, res) => {
+app.delete("/tasks/:id", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
   try {
     const del = await pool.query(`DELETE FROM tasks WHERE id=$1`, [taskId]);
@@ -671,7 +856,7 @@ app.delete("/tasks/:id", async (req, res) => {
   }
 });
 
-app.post("/tasks/:id/tags", async (req, res) => {
+app.post("/tasks/:id/tags", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
   const { tag_id } = req.body;
   if (!tag_id) return res.status(400).json({ error: "tag_id is required" });
@@ -687,7 +872,7 @@ app.post("/tasks/:id/tags", async (req, res) => {
   }
 });
 
-app.delete("/tasks/:id/tags/:tagId", async (req, res) => {
+app.delete("/tasks/:id/tags/:tagId", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
   const tagId = Number(req.params.tagId);
   try {
