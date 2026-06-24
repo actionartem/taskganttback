@@ -66,6 +66,8 @@ export function setupSwagger(app) {
               start_at: { type: "string", format: "date-time", nullable: true },
               due_at: { type: "string", format: "date-time", nullable: true },
               link_url: { type: "string", nullable: true },
+              approved_hours: { type: "number", nullable: true },
+              spent_hours: { type: "number", nullable: true },
               created_at: { type: "string", format: "date-time" },
               updated_at: { type: "string", format: "date-time" },
               assignee_name: { type: "string", nullable: true },
@@ -87,6 +89,8 @@ export function setupSwagger(app) {
               start_at: { type: "string", format: "date-time", nullable: true },
               due_at: { type: "string", format: "date-time", nullable: true },
               link_url: { type: "string", nullable: true },
+              approved_hours: { type: "number", nullable: true },
+              spent_hours: { type: "number", nullable: true },
             },
           },
           Error: {

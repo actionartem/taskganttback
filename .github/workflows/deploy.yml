@@ -29,6 +29,37 @@ jobs:
             cd /srv/tasktracker
             git fetch origin main
             git reset --hard origin/main
+            docker compose up -d db
+            set -a
+            . ./.env
+            set +a
+            POSTGRES_USER="${POSTGRES_USER:-taskuser}"
+            POSTGRES_DB="${POSTGRES_DB:-taskdb}"
+            backup_dir="/srv/tasktracker/manual-backups"
+            mkdir -p "$backup_dir"
+            backup_file="$backup_dir/pre-migrations-$(date +%Y%m%d-%H%M%S).dump"
+            docker compose exec -T db pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > "$backup_file"
+            printf '%s\n' \
+              "CREATE TABLE IF NOT EXISTS schema_migrations (" \
+              "  name text PRIMARY KEY," \
+              "  applied_at timestamptz NOT NULL DEFAULT NOW()" \
+              ");" \
+              | docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            for migration in migrations/*.sql; do
+              [ -e "$migration" ] || continue
+              name="$(basename "$migration")"
+              applied="$(
+                docker compose exec -T db psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                  -c "SELECT 1 FROM schema_migrations WHERE name = '$name'"
+              )"
+              if [ "$applied" = "1" ]; then
+                echo "Migration already applied: $name"
+                continue
+              fi
+              docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" < "$migration"
+              docker compose exec -T db psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+                -c "INSERT INTO schema_migrations (name) VALUES ('$name')"
+            done
             docker compose up -d --build
             docker image prune -f
           SSH

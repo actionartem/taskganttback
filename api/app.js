@@ -46,6 +46,20 @@ const toStr = (v) => (typeof v === "string" ? v : v == null ? null : String(v));
 const toInt = (v) => (v == null || v === "" ? null : Number(v));
 const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
 
+function parseOptionalHours(value) {
+  if (value == null) return null;
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "") return null;
+  const n = Number(text);
+  return Number.isFinite(n) && n >= 0 ? n : Number.NaN;
+}
+
+function toNullableNumber(value) {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 const STATUS_API_TO_UI = {
   new: "не в работе",
   in_progress: "разработка",
@@ -681,6 +695,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
       SELECT
         t.id, t.title, t.description, t.status, t.priority,
         t.assignee_user_id, t.start_at, t.due_at, t.link_url,
+        t.approved_hours, t.spent_hours,
         t.created_at, t.updated_at,
         u.name AS assignee_name, u.role_text AS assignee_role
       FROM tasks t
@@ -716,6 +731,8 @@ app.get("/tasks", requireAuth, async (req, res) => {
       start_at: row.start_at,
       due_at: row.due_at,
       link_url: row.link_url,
+      approved_hours: toNullableNumber(row.approved_hours),
+      spent_hours: toNullableNumber(row.spent_hours),
       created_at: row.created_at,
       updated_at: row.updated_at,
       assignee_name: row.assignee_name,
@@ -742,11 +759,19 @@ app.post("/tasks", requireEditor, async (req, res) => {
     created_by,
     priority,
     status,
+    approved_hours,
+    spent_hours,
   } = req.body;
 
   if (!title) return res.status(400).json({ error: "title is required" });
 
   try {
+    const approvedHours = parseOptionalHours(approved_hours);
+    const spentHours = parseOptionalHours(spent_hours);
+    if (Number.isNaN(approvedHours) || Number.isNaN(spentHours)) {
+      return res.status(400).json({ error: "hours must be non-negative numbers" });
+    }
+
     const actorId = req.user?.id || toInt(created_by);
     // Если ID передан — проверим уникальность
     const idProvided = toInt(clientId);
@@ -760,10 +785,10 @@ app.post("/tasks", requireEditor, async (req, res) => {
       sql = `
         INSERT INTO tasks
           (id, title, description, assignee_user_id, start_at, due_at, link_url,
-           created_by, updated_by, priority, status)
+           created_by, updated_by, priority, status, approved_hours, spent_hours)
         VALUES
           ($1, $2, $3, $4, $5, $6, $7,
-           $8, $8, COALESCE($9,'low'), COALESCE($10,'не в работе'))
+           $8, $8, COALESCE($9,'low'), COALESCE($10,'не в работе'), $11, $12)
         RETURNING id
       `;
       params = [
@@ -777,15 +802,17 @@ app.post("/tasks", requireEditor, async (req, res) => {
         actorId,
         priority || null,
         normalizeStatus(status) || "не в работе",
+        approvedHours,
+        spentHours,
       ];
     } else {
       sql = `
         INSERT INTO tasks
           (title, description, assignee_user_id, start_at, due_at, link_url,
-           created_by, updated_by, priority, status)
+           created_by, updated_by, priority, status, approved_hours, spent_hours)
         VALUES
           ($1, $2, $3, $4, $5, $6,
-           $7, $7, COALESCE($8,'low'), COALESCE($9,'не в работе'))
+           $7, $7, COALESCE($8,'low'), COALESCE($9,'не в работе'), $10, $11)
         RETURNING id
       `;
       params = [
@@ -798,6 +825,8 @@ app.post("/tasks", requireEditor, async (req, res) => {
         actorId,
         priority || null,
         normalizeStatus(status) || "не в работе",
+        approvedHours,
+        spentHours,
       ];
     }
 
@@ -850,6 +879,8 @@ app.patch("/tasks/:id", requireEditor, async (req, res) => {
     link_url,
     priority,
     updated_by,
+    approved_hours,
+    spent_hours,
   } = body;
 
   try {
@@ -879,9 +910,28 @@ app.patch("/tasks/:id", requireEditor, async (req, res) => {
     if (hasOwn(body, "due_at")) addSet("due_at", due_at || null);
     if (hasOwn(body, "link_url")) addSet("link_url", cleanNullableText(link_url));
     if (hasOwn(body, "priority")) addSet("priority", cleanNullableText(priority) || before.priority);
+    if (hasOwn(body, "approved_hours")) {
+      const approvedHours = parseOptionalHours(approved_hours);
+      if (Number.isNaN(approvedHours)) {
+        return res.status(400).json({ error: "approved_hours must be a non-negative number" });
+      }
+      addSet("approved_hours", approvedHours);
+    }
+    if (hasOwn(body, "spent_hours")) {
+      const spentHours = parseOptionalHours(spent_hours);
+      if (Number.isNaN(spentHours)) {
+        return res.status(400).json({ error: "spent_hours must be a non-negative number" });
+      }
+      addSet("spent_hours", spentHours);
+    }
 
     if (setParts.length === 0) {
-      return res.json({ ...before, status: normalizeStatus(before.status) });
+      return res.json({
+        ...before,
+        status: normalizeStatus(before.status),
+        approved_hours: toNullableNumber(before.approved_hours),
+        spent_hours: toNullableNumber(before.spent_hours),
+      });
     }
 
     addSet("updated_by", req.user.id || toInt(updated_by));
@@ -938,7 +988,12 @@ app.patch("/tasks/:id", requireEditor, async (req, res) => {
       await notifyAssignee(nextAssigneeId, `📌 Вам назначена задача #${taskId}: ${after.title}`);
     }
 
-    res.json({ ...after, status: normalizeStatus(after.status) });
+    res.json({
+      ...after,
+      status: normalizeStatus(after.status),
+      approved_hours: toNullableNumber(after.approved_hours),
+      spent_hours: toNullableNumber(after.spent_hours),
+    });
   } catch (e) {
     console.error("PATCH /tasks/:id error:", e);
     res.status(500).json({ error: "db error" });

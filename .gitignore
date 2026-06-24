@@ -22,3 +22,5 @@ yarn-error.log*
 # DB dumps
 simpletracker.dump
 *.sql
+!migrations/
+!migrations/*.sql
