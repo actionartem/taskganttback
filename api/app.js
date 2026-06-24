@@ -1,7 +1,6 @@
 // app.js — SimpleTracker API (без "досок" и без истории задач)
 
 import express from "express";
-import cors from "cors";
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
 import crypto from "crypto";
@@ -9,21 +8,6 @@ import crypto from "crypto";
 const { Pool } = pkg;
 const app = express();
 
-const DEFAULT_CORS_ORIGINS = "https://simpletracker.ru,https://www.simpletracker.ru";
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || DEFAULT_CORS_ORIGINS)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin || CORS_ORIGINS.includes(origin)) return cb(null, true);
-    return cb(new Error("not allowed by CORS"));
-  },
-  allowedHeaders: ["Content-Type", "Authorization", "X-Internal-Token"],
-  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-  credentials: true,
-}));
 app.use(express.json());
 
 // ================== CONFIG ==================
