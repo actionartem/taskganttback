@@ -22,6 +22,7 @@ app.use(cors({
   },
   allowedHeaders: ["Content-Type", "Authorization", "X-Internal-Token"],
   methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  credentials: true,
 }));
 app.use(express.json());
 
@@ -39,8 +40,13 @@ const INTERNAL_API_TOKEN =
   process.env.BOT_API_TOKEN ||
   TELEGRAM_BOT_TOKEN;
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 30);
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "st_session";
+const SESSION_COOKIE_DOMAIN = process.env.SESSION_COOKIE_DOMAIN || ".simpletracker.ru";
 const ALLOW_PASSWORDLESS_LOGIN = process.env.ALLOW_PASSWORDLESS_LOGIN === "true";
 const ALLOW_PUBLIC_REGISTRATION = process.env.ALLOW_PUBLIC_REGISTRATION === "true";
+const AUTH_RATE_LIMIT_WINDOW_MS = Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS || 60 * 1000);
+const AUTH_RATE_LIMIT_MAX = Number(process.env.AUTH_RATE_LIMIT_MAX || 10);
+const authRateBuckets = new Map();
 
 // ================== DB ==================
 const pool = new Pool({
@@ -148,8 +154,64 @@ function getBearerToken(req) {
   return match ? match[1].trim() : null;
 }
 
+function getCookie(req, name) {
+  const header = req.get("cookie") || "";
+  for (const part of header.split(";")) {
+    const [rawKey, ...rawValue] = part.trim().split("=");
+    if (rawKey === name) return decodeURIComponent(rawValue.join("="));
+  }
+  return null;
+}
+
+function getRequestSessionToken(req) {
+  return getBearerToken(req) || getCookie(req, SESSION_COOKIE_NAME);
+}
+
 function withSession(user) {
   return { ...user, token: createSessionToken(user) };
+}
+
+function sendSession(res, user, status = 200) {
+  const payload = withSession(user);
+  res.cookie(SESSION_COOKIE_NAME, payload.token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    domain: SESSION_COOKIE_DOMAIN || undefined,
+    maxAge: SESSION_TTL_SECONDS * 1000,
+    path: "/",
+  });
+  return res.status(status).json(payload);
+}
+
+function clearSessionCookie(res) {
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "lax",
+    domain: SESSION_COOKIE_DOMAIN || undefined,
+    path: "/",
+  });
+}
+
+function rateLimitAuth(req, res, next) {
+  const key = `${req.ip || req.socket?.remoteAddress || "unknown"}:${req.body?.login || ""}`;
+  const now = Date.now();
+  const bucket = authRateBuckets.get(key) || { count: 0, resetAt: now + AUTH_RATE_LIMIT_WINDOW_MS };
+
+  if (bucket.resetAt <= now) {
+    bucket.count = 0;
+    bucket.resetAt = now + AUTH_RATE_LIMIT_WINDOW_MS;
+  }
+
+  bucket.count += 1;
+  authRateBuckets.set(key, bucket);
+
+  if (bucket.count > AUTH_RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: "too many auth attempts" });
+  }
+
+  return next();
 }
 
 async function authenticateRequest(req, res, next) {
@@ -160,7 +222,7 @@ async function authenticateRequest(req, res, next) {
       return next();
     }
 
-    const payload = verifySessionToken(getBearerToken(req));
+    const payload = verifySessionToken(getRequestSessionToken(req));
     if (!payload) return res.status(401).json({ error: "unauthorized" });
 
     const r = await pool.query(
@@ -194,6 +256,31 @@ function requireUser(req, res, next) {
 function requireSuperadmin(req, res, next) {
   return authenticateRequest(req, res, () => {
     if (!req.user?.is_superadmin) return res.status(403).json({ error: "forbidden" });
+    return next();
+  });
+}
+
+function getRoleText(user) {
+  return String(user?.role_text || "").toLowerCase();
+}
+
+function isReadOnlyUser(user) {
+  if (!user || user.is_superadmin) return false;
+  const role = getRoleText(user);
+  return [
+    "viewer",
+    "read-only",
+    "readonly",
+    "только чтение",
+    "просмотр",
+    "наблюдатель",
+  ].some((marker) => role.includes(marker));
+}
+
+function requireEditor(req, res, next) {
+  return authenticateRequest(req, res, () => {
+    if (!req.user) return res.status(401).json({ error: "unauthorized" });
+    if (isReadOnlyUser(req.user)) return res.status(403).json({ error: "read only user" });
     return next();
   });
 }
@@ -268,7 +355,7 @@ function needsPasswordRehash(storedHash) {
   return !storedHash || !storedHash.startsWith("scrypt:");
 }
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", rateLimitAuth, async (req, res) => {
   if (!ALLOW_PASSWORDLESS_LOGIN) {
     return res.status(403).json({ error: "passwordless login is disabled" });
   }
@@ -282,14 +369,14 @@ app.post("/auth/login", async (req, res) => {
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
     const u = r.rows[0];
-    res.json(withSession(u));
+    return sendSession(res, u);
   } catch (e) {
     console.error("auth/login error:", e);
     res.status(500).json({ error: "db error" });
   }
 });
 
-app.post("/auth/register-password", async (req, res) => {
+app.post("/auth/register-password", rateLimitAuth, async (req, res) => {
   const { login, password, name, role_text } = req.body;
   if (!login || !password || !name)
     return res.status(400).json({ error: "login, password and name are required" });
@@ -315,14 +402,14 @@ app.post("/auth/register-password", async (req, res) => {
       `,
       [login, passHash, name, role_text || "", isFirstUser]
     );
-    res.status(201).json(withSession(ins.rows[0]));
+    return sendSession(res, ins.rows[0], 201);
   } catch (e) {
     console.error("auth/register-password error:", e);
     res.status(500).json({ error: "db error" });
   }
 });
 
-app.post("/auth/login-password", async (req, res) => {
+app.post("/auth/login-password", rateLimitAuth, async (req, res) => {
   const { login, password } = req.body;
   if (!login || !password) return res.status(400).json({ error: "login and password are required" });
   try {
@@ -339,9 +426,39 @@ app.post("/auth/login-password", async (req, res) => {
       await pool.query(`UPDATE users SET password_hash=$1 WHERE id=$2`, [hashPassword(password), u.id]);
     }
     delete u.password_hash;
-    res.json(withSession(u));
+    return sendSession(res, u);
   } catch (e) {
     console.error("auth/login-password error:", e);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
+app.post("/auth/logout", (req, res) => {
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.post("/auth/change-password", requireUser, async (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password) {
+    return res.status(400).json({ error: "current_password and new_password are required" });
+  }
+  if (String(new_password).length < 8) {
+    return res.status(400).json({ error: "new password must be at least 8 characters" });
+  }
+
+  try {
+    const r = await pool.query(`SELECT id, password_hash FROM users WHERE id=$1`, [req.user.id]);
+    if (r.rowCount === 0) return res.status(404).json({ error: "user not found" });
+    const user = r.rows[0];
+    if (!verifyPassword(current_password, user.password_hash)) {
+      return res.status(401).json({ error: "wrong password" });
+    }
+
+    await pool.query(`UPDATE users SET password_hash=$1 WHERE id=$2`, [hashPassword(new_password), req.user.id]);
+    return sendSession(res, req.user);
+  } catch (e) {
+    console.error("auth/change-password error:", e);
     res.status(500).json({ error: "db error" });
   }
 });
@@ -526,7 +643,7 @@ app.get("/tags", requireUser, async (req, res) => {
   }
 });
 
-app.post("/tags", requireUser, async (req, res) => {
+app.post("/tags", requireEditor, async (req, res) => {
   const { title, color } = req.body;
   if (!title) return res.status(400).json({ error: "title is required" });
   try {
@@ -541,7 +658,7 @@ app.post("/tags", requireUser, async (req, res) => {
   }
 });
 
-app.delete("/tags/:tagId", requireUser, async (req, res) => {
+app.delete("/tags/:tagId", requireEditor, async (req, res) => {
   const tagId = Number(req.params.tagId);
   try {
     await pool.query(`DELETE FROM task_tags WHERE tag_id=$1`, [tagId]);
@@ -629,7 +746,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/tasks", requireUser, async (req, res) => {
+app.post("/tasks", requireEditor, async (req, res) => {
   const {
     id: clientId,            // пользовательский ID (необязателен, но можно передать)
     title,
@@ -736,7 +853,7 @@ app.get("/tasks/:id/history", requireUser, async (req, res) => {
 });
 
 
-app.patch("/tasks/:id", requireUser, async (req, res) => {
+app.patch("/tasks/:id", requireEditor, async (req, res) => {
   const taskId = Number(req.params.id);
   const body = req.body || {};
   const {
@@ -844,7 +961,7 @@ app.patch("/tasks/:id", requireUser, async (req, res) => {
   }
 });
 
-app.delete("/tasks/:id", requireUser, async (req, res) => {
+app.delete("/tasks/:id", requireEditor, async (req, res) => {
   const taskId = Number(req.params.id);
   try {
     const del = await pool.query(`DELETE FROM tasks WHERE id=$1`, [taskId]);
@@ -856,7 +973,7 @@ app.delete("/tasks/:id", requireUser, async (req, res) => {
   }
 });
 
-app.post("/tasks/:id/tags", requireUser, async (req, res) => {
+app.post("/tasks/:id/tags", requireEditor, async (req, res) => {
   const taskId = Number(req.params.id);
   const { tag_id } = req.body;
   if (!tag_id) return res.status(400).json({ error: "tag_id is required" });
@@ -872,7 +989,7 @@ app.post("/tasks/:id/tags", requireUser, async (req, res) => {
   }
 });
 
-app.delete("/tasks/:id/tags/:tagId", requireUser, async (req, res) => {
+app.delete("/tasks/:id/tags/:tagId", requireEditor, async (req, res) => {
   const taskId = Number(req.params.id);
   const tagId = Number(req.params.tagId);
   try {
