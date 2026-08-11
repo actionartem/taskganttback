@@ -60,6 +60,16 @@ export function setupSwagger(app) {
               id: { type: "integer" },
               title: { type: "string" },
               description: { type: "string", nullable: true },
+              email_thread: {
+                type: "string",
+                nullable: true,
+                description: "Ссылка или идентификатор треда в почте",
+              },
+              document_history: {
+                type: "string",
+                nullable: true,
+                description: "Ручная история отправки и получения документов",
+              },
               status: { type: "string" },
               priority: { type: "string", enum: ["low", "medium", "high"] },
               assignee_user_id: { type: "integer", nullable: true },
@@ -83,6 +93,16 @@ export function setupSwagger(app) {
             properties: {
               title: { type: "string" },
               description: { type: "string", nullable: true },
+              email_thread: {
+                type: "string",
+                nullable: true,
+                description: "Ссылка или идентификатор треда в почте",
+              },
+              document_history: {
+                type: "string",
+                nullable: true,
+                description: "Ручная история отправки и получения документов",
+              },
               status: { type: "string" },
               priority: { type: "string", enum: ["low", "medium", "high"] },
               assignee_user_id: { type: "integer", nullable: true },

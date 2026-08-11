@@ -940,7 +940,8 @@ app.get("/tasks", requireAuth, async (req, res) => {
     const tasksRes = await pool.query(
       `
       SELECT
-        t.id, t.title, t.description, t.status, t.priority,
+        t.id, t.title, t.description, t.email_thread, t.document_history,
+        t.status, t.priority,
         t.assignee_user_id, t.start_at, t.due_at, t.link_url,
         t.approved_hours, t.spent_hours,
         t.created_at, t.updated_at,
@@ -972,6 +973,8 @@ app.get("/tasks", requireAuth, async (req, res) => {
       id: row.id,
       title: row.title,
       description: row.description,
+      email_thread: row.email_thread,
+      document_history: row.document_history,
       status: normalizeStatus(row.status),
       priority: row.priority,
       assignee_user_id: row.assignee_user_id,
@@ -1059,6 +1062,8 @@ app.post("/tasks", requireEditor, async (req, res) => {
     id: clientId,            // пользовательский ID (необязателен, но можно передать)
     title,
     description,
+    email_thread,
+    document_history,
     assignee_user_id,
     start_at,
     due_at,
@@ -1091,17 +1096,20 @@ app.post("/tasks", requireEditor, async (req, res) => {
     if (idProvided != null) {
       sql = `
         INSERT INTO tasks
-          (id, title, description, assignee_user_id, start_at, due_at, link_url,
+          (id, title, description, email_thread, document_history,
+           assignee_user_id, start_at, due_at, link_url,
            created_by, updated_by, priority, status, approved_hours, spent_hours)
         VALUES
-          ($1, $2, $3, $4, $5, $6, $7,
-           $8, $8, COALESCE($9,'low'), COALESCE($10,'не в работе'), $11, $12)
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+           $10, $10, COALESCE($11,'low'), COALESCE($12,'не в работе'), $13, $14)
         RETURNING id
       `;
       params = [
         idProvided,
         title,
         cleanNullableText(description),
+        cleanNullableText(email_thread),
+        cleanNullableText(document_history),
         toInt(assignee_user_id),
         start_at || null,
         due_at || null,
@@ -1115,16 +1123,19 @@ app.post("/tasks", requireEditor, async (req, res) => {
     } else {
       sql = `
         INSERT INTO tasks
-          (title, description, assignee_user_id, start_at, due_at, link_url,
+          (title, description, email_thread, document_history,
+           assignee_user_id, start_at, due_at, link_url,
            created_by, updated_by, priority, status, approved_hours, spent_hours)
         VALUES
-          ($1, $2, $3, $4, $5, $6,
-           $7, $7, COALESCE($8,'low'), COALESCE($9,'не в работе'), $10, $11)
+          ($1, $2, $3, $4, $5, $6, $7, $8,
+           $9, $9, COALESCE($10,'low'), COALESCE($11,'не в работе'), $12, $13)
         RETURNING id
       `;
       params = [
         title,
         cleanNullableText(description),
+        cleanNullableText(email_thread),
+        cleanNullableText(document_history),
         toInt(assignee_user_id),
         start_at || null,
         due_at || null,
@@ -1179,6 +1190,8 @@ app.patch("/tasks/:id", requireEditor, async (req, res) => {
   const {
     title,
     description,
+    email_thread,
+    document_history,
     status,
     assignee_user_id,
     start_at,
@@ -1211,6 +1224,10 @@ app.patch("/tasks/:id", requireEditor, async (req, res) => {
       addSet("title", cleanTitle);
     }
     if (hasOwn(body, "description")) addSet("description", cleanNullableText(description));
+    if (hasOwn(body, "email_thread")) addSet("email_thread", cleanNullableText(email_thread));
+    if (hasOwn(body, "document_history")) {
+      addSet("document_history", cleanNullableText(document_history));
+    }
     if (hasOwn(body, "status")) addSet("status", normalizeStatus(status) || before.status);
     if (hasOwn(body, "assignee_user_id")) addSet("assignee_user_id", toInt(assignee_user_id));
     if (hasOwn(body, "start_at")) addSet("start_at", start_at || null);

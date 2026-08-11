@@ -1,0 +1,3 @@
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS email_thread TEXT,
+  ADD COLUMN IF NOT EXISTS document_history TEXT;
