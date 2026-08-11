@@ -12,6 +12,12 @@ const MAIL_EVENT_FIELDS = new Set([
 const ISO_DATE_TIME_PATTERN =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/i;
 const MOSCOW_TIME_ZONE = "Europe/Moscow";
+const LEGACY_STATUS_TO_UI = {
+  new: "не в работе",
+  in_progress: "разработка",
+  done: "завершена",
+  review: "ревью",
+};
 
 class MailIntegrationRequestError extends Error {
   constructor(status, code, details) {
@@ -171,7 +177,8 @@ export function validateMailEventPayload(body) {
 }
 
 function normalizedStatus(value) {
-  return String(value || "").trim().toLowerCase();
+  const status = String(value || "").trim().toLowerCase();
+  return status ? LEGACY_STATUS_TO_UI[status] || status : null;
 }
 
 function dateTimeJsonValue(value) {
@@ -318,6 +325,21 @@ export function createMailIntegrationHandler({ pool, mailIntegrationToken }) {
          WHERE id = $${updateValues.length}`,
         updateValues
       );
+
+      const taskChanges = [];
+      if (oldStatus !== nextStatus) {
+        taskChanges.push(["status", oldStatus, nextStatus]);
+      }
+      if (oldDueAt !== dueAt) {
+        taskChanges.push(["due_at", oldDueAt, dueAt]);
+      }
+      for (const [fieldName, oldValue, newValue] of taskChanges) {
+        await client.query(
+          `INSERT INTO task_change_log (task_id, field_name, old_value, new_value)
+           VALUES ($1, $2, $3, $4)`,
+          [event.taskId, fieldName, oldValue, newValue]
+        );
+      }
 
       await client.query(
         `UPDATE processed_mail_events

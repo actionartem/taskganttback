@@ -10,12 +10,14 @@ function clone(value) {
 }
 
 class FakePool {
-  constructor({ tasks = [], users = [] } = {}) {
+  constructor({ tasks = [], users = [], failOnProcessedResultUpdate = false } = {}) {
     this.tasks = new Map(tasks.map((task) => [Number(task.id), clone(task)]));
     this.users = new Map(users.map((user) => [Number(user.id), clone(user)]));
     this.processedEvents = new Map();
+    this.taskChangeLog = [];
     this.nextProcessedEventId = 1;
     this.connectCount = 0;
+    this.failOnProcessedResultUpdate = failOnProcessedResultUpdate;
   }
 
   snapshot() {
@@ -23,6 +25,7 @@ class FakePool {
       tasks: clone(Array.from(this.tasks.entries())),
       users: clone(Array.from(this.users.entries())),
       processedEvents: clone(Array.from(this.processedEvents.entries())),
+      taskChangeLog: clone(this.taskChangeLog),
       nextProcessedEventId: this.nextProcessedEventId,
     };
   }
@@ -31,6 +34,7 @@ class FakePool {
     this.tasks = new Map(snapshot.tasks);
     this.users = new Map(snapshot.users);
     this.processedEvents = new Map(snapshot.processedEvents);
+    this.taskChangeLog = snapshot.taskChangeLog;
     this.nextProcessedEventId = snapshot.nextProcessedEventId;
   }
 
@@ -114,7 +118,21 @@ class FakeClient {
       return { rowCount: 1, rows: [] };
     }
 
+    if (sql.startsWith("INSERT INTO task_change_log")) {
+      const [taskId, fieldName, oldValue, newValue] = params;
+      this.pool.taskChangeLog.push({
+        task_id: Number(taskId),
+        field_name: fieldName,
+        old_value: oldValue,
+        new_value: newValue,
+      });
+      return { rowCount: 1, rows: [] };
+    }
+
     if (sql.startsWith("UPDATE processed_mail_events SET result")) {
+      if (sql.includes("'updated'") && this.pool.failOnProcessedResultUpdate) {
+        throw new Error("simulated processed event result failure");
+      }
       const eventId = Number(params[0]);
       const row = Array.from(this.pool.processedEvents.values()).find((item) => item.id === eventId);
       assert.ok(row, `fake processed event ${eventId} must exist before UPDATE`);
@@ -270,6 +288,20 @@ test("processes incoming from approval atomically with Moscow time and +7 calend
     new: "2026-08-19T00:00:00.000Z",
   });
   assert.equal(Object.hasOwn(res.body.changes, "assignee_user_id"), false);
+  assert.deepEqual(pool.taskChangeLog, [
+    {
+      task_id: 13990,
+      field_name: "status",
+      old_value: "на согласовании",
+      new_value: "в аналитике",
+    },
+    {
+      task_id: 13990,
+      field_name: "due_at",
+      old_value: "2026-08-14T00:00:00.000Z",
+      new_value: "2026-08-19T00:00:00.000Z",
+    },
+  ]);
 });
 
 test("returns manual_review for incoming in another status without changing the task", async () => {
@@ -294,6 +326,7 @@ test("returns manual_review for incoming in another status without changing the 
     changes: {},
   });
   assert.deepEqual(pool.tasks.get(13990), originalTask);
+  assert.deepEqual(pool.taskChangeLog, []);
 });
 
 test("processes outgoing with an active assignee", async () => {
@@ -336,7 +369,7 @@ test("processes outgoing without changing the assignee when it is omitted", asyn
     tasks: [
       {
         id: 13990,
-        status: "ревью",
+        status: "review",
         due_at: null,
         assignee_user_id: 4,
         document_history: "   ",
@@ -351,11 +384,38 @@ test("processes outgoing without changing the assignee when it is omitted", asyn
 
   assert.equal(res.statusCode, 200);
   assert.equal(task.assignee_user_id, 4);
+  assert.deepEqual(res.body.changes.status, { old: "ревью", new: "на согласовании" });
   assert.equal(
     task.document_history,
     "11.08.2026 12:15 - документ отправлен Имя Фамилия Отчество"
   );
   assert.equal(Object.hasOwn(res.body.changes, "assignee_user_id"), false);
+});
+
+test("does not write task_change_log rows for unchanged status and due_at", async () => {
+  const pool = new FakePool({
+    tasks: [
+      {
+        id: 13990,
+        status: "на согласовании",
+        due_at: "2026-08-18T00:00:00.000Z",
+        assignee_user_id: 4,
+        document_history: null,
+        approved_hours: 8,
+        spent_hours: 3,
+      },
+    ],
+  });
+
+  const res = await invoke({ pool, body: validOutgoing() });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.result, "updated");
+  assert.deepEqual(pool.taskChangeLog, []);
+  assert.equal(
+    pool.tasks.get(13990).document_history,
+    "11.08.2026 12:15 - документ отправлен Имя Фамилия Отчество"
+  );
 });
 
 test("rejects an inactive or missing outgoing assignee and rolls back", async () => {
@@ -380,6 +440,38 @@ test("rejects an inactive or missing outgoing assignee and rolls back", async ()
   assert.deepEqual(res.body, { error: "active_assignee_not_found" });
   assert.deepEqual(pool.tasks.get(13990), originalTask);
   assert.equal(pool.processedEvents.size, 0);
+  assert.deepEqual(pool.taskChangeLog, []);
+});
+
+test("rolls back task_change_log together with task and deduplication changes", async () => {
+  const originalTask = {
+    id: 13990,
+    status: "на согласовании",
+    due_at: "2026-08-14T00:00:00.000Z",
+    assignee_user_id: 4,
+    document_history: "До ошибки",
+    approved_hours: 6,
+    spent_hours: 1,
+  };
+  const pool = new FakePool({
+    tasks: [originalTask],
+    failOnProcessedResultUpdate: true,
+  });
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  let res;
+  try {
+    res = await invoke({ pool, body: validIncoming() });
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(res.body, { error: "db error" });
+  assert.deepEqual(pool.tasks.get(13990), originalTask);
+  assert.equal(pool.processedEvents.size, 0);
+  assert.deepEqual(pool.taskChangeLog, []);
 });
 
 test("deduplicates normalized Message-ID and does not append history twice", async () => {
@@ -402,6 +494,7 @@ test("deduplicates normalized Message-ID and does not append history twice", asy
     body: validIncoming({ message_id: "  <Case-Sensitive@Example.Test>  " }),
   });
   const historyAfterFirst = pool.tasks.get(13990).document_history;
+  const changeLogAfterFirst = clone(pool.taskChangeLog);
 
   const duplicate = await invoke({
     pool,
@@ -417,6 +510,7 @@ test("deduplicates normalized Message-ID and does not append history twice", asy
   });
   assert.equal(pool.tasks.get(13990).document_history, historyAfterFirst);
   assert.equal(pool.processedEvents.size, 1);
+  assert.deepEqual(pool.taskChangeLog, changeLogAfterFirst);
   assert.equal(pool.tasks.get(13990).approved_hours, 6);
   assert.equal(pool.tasks.get(13990).spent_hours, 1);
 });
