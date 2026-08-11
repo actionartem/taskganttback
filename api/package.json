@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "main": "app.js",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "exceljs": "^4.4.0",
     "express": "^4.19.2",

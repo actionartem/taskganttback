@@ -3,6 +3,7 @@
 import express from "express";
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
+import { createMailIntegrationHandler } from "./mail-integration.js";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -26,6 +27,7 @@ const INTERNAL_API_TOKEN =
   process.env.INTERNAL_API_TOKEN ||
   process.env.BOT_API_TOKEN ||
   TELEGRAM_BOT_TOKEN;
+const MAIL_INTEGRATION_TOKEN = process.env.MAIL_INTEGRATION_TOKEN;
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 30);
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || "st_session";
 const SESSION_COOKIE_DOMAIN = process.env.SESSION_COOKIE_DOMAIN || ".simpletracker.ru";
@@ -571,6 +573,12 @@ setupSwagger(app);
 
 // ================== Health ==================
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ================== Mail integration ==================
+app.post(
+  "/integrations/mail-event",
+  createMailIntegrationHandler({ pool, mailIntegrationToken: MAIL_INTEGRATION_TOKEN })
+);
 
 // ================== Auth ==================
 function hashPassword(pwd) {

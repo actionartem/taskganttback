@@ -3,6 +3,7 @@ import swaggerJSDoc from "swagger-jsdoc";
 
 const authSecurity = [{ bearerAuth: [] }, { sessionCookie: [] }];
 const internalSecurity = [{ internalToken: [] }];
+const mailIntegrationSecurity = [{ mailIntegrationToken: [] }];
 
 export function setupSwagger(app) {
   const options = {
@@ -10,7 +11,7 @@ export function setupSwagger(app) {
       openapi: "3.0.0",
       info: {
         title: "SimpleTracker API",
-        version: "1.1.0",
+        version: "1.2.0",
         description: "API таск-трекера SimpleTracker.",
       },
       servers: [
@@ -21,6 +22,11 @@ export function setupSwagger(app) {
           bearerAuth: { type: "http", scheme: "bearer" },
           sessionCookie: { type: "apiKey", in: "cookie", name: "st_session" },
           internalToken: { type: "apiKey", in: "header", name: "X-Internal-Token" },
+          mailIntegrationToken: {
+            type: "apiKey",
+            in: "header",
+            name: "X-Mail-Integration-Token",
+          },
         },
         schemas: {
           AuthSession: {
@@ -113,6 +119,63 @@ export function setupSwagger(app) {
               spent_hours: { type: "number", nullable: true },
             },
           },
+          MailEventRequest: {
+            type: "object",
+            additionalProperties: false,
+            required: ["message_id", "task_id", "direction", "event_at"],
+            properties: {
+              message_id: {
+                type: "string",
+                description: "Устойчивый Message-ID; пробелы и окружающие угловые скобки нормализуются",
+              },
+              task_id: { type: "integer", minimum: 1 },
+              direction: { type: "string", enum: ["incoming", "outgoing"] },
+              event_at: { type: "string", format: "date-time" },
+              sender_name: {
+                type: "string",
+                description: "Обязательно для outgoing",
+              },
+              assignee_user_id: {
+                type: "integer",
+                minimum: 1,
+                description: "Допустимо только для outgoing; пользователь должен быть активным",
+              },
+            },
+          },
+          MailEventStringChange: {
+            type: "object",
+            required: ["old", "new"],
+            properties: {
+              old: { type: "string", nullable: true },
+              new: { type: "string", nullable: true },
+            },
+          },
+          MailEventAssigneeChange: {
+            type: "object",
+            required: ["old", "new"],
+            properties: {
+              old: { type: "integer", nullable: true },
+              new: { type: "integer", nullable: true },
+            },
+          },
+          MailEventResponse: {
+            type: "object",
+            required: ["result", "duplicate", "task_id", "changes"],
+            properties: {
+              result: { type: "string", enum: ["updated", "manual_review"] },
+              duplicate: { type: "boolean" },
+              task_id: { type: "integer" },
+              changes: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  status: { $ref: "#/components/schemas/MailEventStringChange" },
+                  due_at: { $ref: "#/components/schemas/MailEventStringChange" },
+                  assignee_user_id: { $ref: "#/components/schemas/MailEventAssigneeChange" },
+                },
+              },
+            },
+          },
           TaskExportRequest: {
             type: "object",
             required: ["statuses", "fields"],
@@ -158,6 +221,11 @@ export function setupSwagger(app) {
             type: "object",
             properties: {
               error: { type: "string" },
+              details: {
+                type: "array",
+                items: { type: "string" },
+                description: "Детали ошибок строгой валидации payload",
+              },
             },
           },
         },
@@ -167,6 +235,101 @@ export function setupSwagger(app) {
           get: {
             summary: "Проверка живости API",
             responses: { 200: { description: "OK" } },
+          },
+        },
+        "/integrations/mail-event": {
+          post: {
+            summary: "Обработать входящее или исходящее почтовое событие",
+            description:
+              "Использует отдельный MAIL_INTEGRATION_TOKEN, атомарно обновляет задачу и дедуплицирует события по нормализованному Message-ID.",
+            security: mailIntegrationSecurity,
+            requestBody: {
+              required: true,
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/MailEventRequest" },
+                  examples: {
+                    incoming: {
+                      value: {
+                        message_id: "<message-id>",
+                        task_id: 13990,
+                        direction: "incoming",
+                        event_at: "2026-08-11T09:15:00Z",
+                      },
+                    },
+                    outgoing: {
+                      value: {
+                        message_id: "<message-id>",
+                        task_id: 13990,
+                        direction: "outgoing",
+                        event_at: "2026-08-11T09:15:00Z",
+                        sender_name: "Имя Фамилия Отчество",
+                        assignee_user_id: 7,
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              200: {
+                description: "Событие обработано или распознано как дубль",
+                content: {
+                  "application/json": {
+                    schema: { $ref: "#/components/schemas/MailEventResponse" },
+                    examples: {
+                      updated: {
+                        value: {
+                          result: "updated",
+                          duplicate: false,
+                          task_id: 13990,
+                          changes: {
+                            status: { old: "в аналитике", new: "на согласовании" },
+                            due_at: {
+                              old: "2026-08-15T00:00:00.000Z",
+                              new: "2026-08-18T00:00:00.000Z",
+                            },
+                            assignee_user_id: { old: 4, new: 7 },
+                          },
+                        },
+                      },
+                      manualReview: {
+                        value: {
+                          result: "manual_review",
+                          duplicate: false,
+                          task_id: 13990,
+                          changes: {},
+                        },
+                      },
+                      duplicate: {
+                        value: {
+                          result: "updated",
+                          duplicate: true,
+                          task_id: 13990,
+                          changes: {},
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+              400: {
+                description: "Невалидный payload или не найден активный исполнитель",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+              },
+              401: {
+                description: "MAIL_INTEGRATION_TOKEN не задан или токен неверный",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+              },
+              404: {
+                description: "Задача не найдена",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+              },
+              500: {
+                description: "Ошибка БД",
+                content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+              },
+            },
           },
         },
         "/auth/login-password": {
