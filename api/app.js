@@ -3,7 +3,7 @@
 import express from "express";
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
-import { createMailIntegrationHandler } from "./mail-integration.js";
+import { createMailIntegrationHandler, createMailTasksHandler } from "./mail-integration.js";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -578,6 +578,10 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 app.post(
   "/integrations/mail-event",
   createMailIntegrationHandler({ pool, mailIntegrationToken: MAIL_INTEGRATION_TOKEN })
+);
+app.get(
+  "/integrations/mail-tasks",
+  createMailTasksHandler({ pool, mailIntegrationToken: MAIL_INTEGRATION_TOKEN })
 );
 
 // ================== Auth ==================

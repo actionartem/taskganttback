@@ -377,3 +377,29 @@ export function createMailIntegrationHandler({ pool, mailIntegrationToken }) {
     }
   };
 }
+
+export function createMailTasksHandler({ pool, mailIntegrationToken }) {
+  return async function mailTasksHandler(req, res) {
+    if (!secureTokenMatches(mailIntegrationToken, req.get("x-mail-integration-token"))) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    try {
+      const result = await pool.query(
+        `SELECT id, title, email_thread
+         FROM tasks
+         ORDER BY id`
+      );
+      return res.json(
+        result.rows.map((task) => ({
+          id: Number(task.id),
+          title: task.title,
+          email_thread: task.email_thread == null ? null : task.email_thread,
+        }))
+      );
+    } catch (error) {
+      console.error("mail tasks lookup error:", error);
+      return res.status(500).json({ error: "db error" });
+    }
+  };
+}

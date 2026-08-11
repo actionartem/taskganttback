@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createMailIntegrationHandler } from "./mail-integration.js";
+import { createMailIntegrationHandler, createMailTasksHandler } from "./mail-integration.js";
 
 const VALID_TOKEN = "test-mail-integration-token-placeholder";
 
@@ -41,6 +41,17 @@ class FakePool {
   async connect() {
     this.connectCount += 1;
     return new FakeClient(this);
+  }
+
+  async query(text) {
+    const sql = String(text).replace(/\s+/g, " ").trim();
+    if (sql.startsWith("SELECT id, title, email_thread FROM tasks")) {
+      const rows = Array.from(this.tasks.values())
+        .sort((left, right) => Number(left.id) - Number(right.id))
+        .map(({ id, title, email_thread = null }) => ({ id, title, email_thread }));
+      return { rowCount: rows.length, rows: clone(rows) };
+    }
+    throw new Error(`Unexpected SQL in fake pool: ${sql}`);
   }
 }
 
@@ -173,6 +184,38 @@ async function invoke({ pool, body, token = VALID_TOKEN, configuredToken = VALID
   await handler(req, res);
   return res;
 }
+
+async function invokeMailTasks({ pool, token = VALID_TOKEN, configuredToken = VALID_TOKEN }) {
+  const handler = createMailTasksHandler({ pool, mailIntegrationToken: configuredToken });
+  const req = {
+    get(name) {
+      return name.toLowerCase() === "x-mail-integration-token" ? token : undefined;
+    },
+  };
+  const res = responseRecorder();
+  await handler(req, res);
+  return res;
+}
+
+test("mail task lookup requires the integration token and returns only matching context", async () => {
+  const pool = new FakePool({
+    tasks: [
+      { id: 20, title: "Вторая задача", email_thread: null, status: "в аналитике" },
+      { id: 10, title: "Первая задача", email_thread: "Тема переписки", description: "secret" },
+    ],
+  });
+
+  const unauthorized = await invokeMailTasks({ pool, token: "wrong-token" });
+  assert.equal(unauthorized.statusCode, 401);
+  assert.deepEqual(unauthorized.body, { error: "unauthorized" });
+
+  const response = await invokeMailTasks({ pool });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body, [
+    { id: 10, title: "Первая задача", email_thread: "Тема переписки" },
+    { id: 20, title: "Вторая задача", email_thread: null },
+  ]);
+});
 
 function validIncoming(overrides = {}) {
   return {

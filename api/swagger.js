@@ -142,6 +142,16 @@ export function setupSwagger(app) {
               },
             },
           },
+          MailTaskContext: {
+            type: "object",
+            additionalProperties: false,
+            required: ["id", "title", "email_thread"],
+            properties: {
+              id: { type: "integer" },
+              title: { type: "string" },
+              email_thread: { type: "string", nullable: true },
+            },
+          },
           MailEventStringChange: {
             type: "object",
             required: ["old", "new"],
@@ -328,6 +338,39 @@ export function setupSwagger(app) {
               500: {
                 description: "Ошибка БД",
                 content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+              },
+            },
+          },
+        },
+        "/integrations/mail-tasks": {
+          get: {
+            summary: "Получить минимальный контекст задач для сопоставления почтового треда",
+            description:
+              "Возвращает только id, title и email_thread. Использует отдельный MAIL_INTEGRATION_TOKEN.",
+            security: mailIntegrationSecurity,
+            responses: {
+              200: {
+                description: "Минимальный список задач",
+                content: {
+                  "application/json": {
+                    schema: {
+                      type: "array",
+                      items: { $ref: "#/components/schemas/MailTaskContext" },
+                    },
+                  },
+                },
+              },
+              401: {
+                description: "Неверный или отсутствующий integration token",
+                content: {
+                  "application/json": { schema: { $ref: "#/components/schemas/Error" } },
+                },
+              },
+              500: {
+                description: "Ошибка БД",
+                content: {
+                  "application/json": { schema: { $ref: "#/components/schemas/Error" } },
+                },
               },
             },
           },
