@@ -15,7 +15,7 @@ export function setupSwagger(app) {
         description: "API таск-трекера SimpleTracker.",
       },
       servers: [
-        { url: "https://api.simpletracker.ru", description: "production" },
+        { url: "/", description: "production" },
       ],
       components: {
         securitySchemes: {
