@@ -7,6 +7,8 @@ RUN npm ci --omit=dev
 
 COPY swagger.js ./
 COPY mail-integration.js ./
+COPY tracker-*.js ./
+COPY agent-guide.txt ./
 
 COPY app.js ./
 

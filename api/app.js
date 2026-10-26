@@ -1,6 +1,10 @@
-// app.js — SimpleTracker API (без "досок" и без истории задач)
+// SimpleTracker API. Transactional history and agent routes live in tracker-*.js.
 
 import express from "express";
+import { registerTrackerRoutes } from './tracker-routes.js';
+import { transaction, writeTask, setTaskTag } from './tracker-store.js';
+import { sessionCodec,sessionMatchesUser } from './tracker-session.js';
+import { RequestError } from './tracker-domain.js';
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
 import { createMailIntegrationHandler, createMailTasksHandler } from "./mail-integration.js";
@@ -12,17 +16,16 @@ import ExcelJS from "exceljs";
 const { Pool } = pkg;
 const app = express();
 
+app.use(['/tasks/:id/documents','/integrations/agent/tasks/:id/documents'], express.json({limit:'15mb'}));
+app.use(['/tasks','/integrations/agent','/integrations/jira'], express.json({limit:'1mb'}));
 app.use(express.json());
 
 // ================== CONFIG ==================
 const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN ||
   process.env.TG_BOT_TOKEN;
-const SESSION_SECRET =
-  process.env.SESSION_SECRET ||
-  process.env.AUTH_SECRET ||
-  process.env.DB_PASSWORD ||
-  TELEGRAM_BOT_TOKEN;
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.AUTH_SECRET;
+if (!SESSION_SECRET || SESSION_SECRET.length < 32) throw new Error('Set a dedicated SESSION_SECRET (at least 32 characters)');
 const INTERNAL_API_TOKEN =
   process.env.INTERNAL_API_TOKEN ||
   process.env.BOT_API_TOKEN ||
@@ -198,48 +201,7 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(left, right);
 }
 
-function base64UrlEncode(value) {
-  return Buffer.from(value).toString("base64url");
-}
-
-function base64UrlJson(value) {
-  return base64UrlEncode(JSON.stringify(value));
-}
-
-function signSessionPayload(payloadBase64) {
-  return crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update(payloadBase64)
-    .digest("base64url");
-}
-
-function createSessionToken(user) {
-  const payload = base64UrlJson({
-    sub: user.id,
-    login: user.login,
-    is_superadmin: !!user.is_superadmin,
-    exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS,
-  });
-  return `${payload}.${signSessionPayload(payload)}`;
-}
-
-function verifySessionToken(token) {
-  if (!SESSION_SECRET || !token) return null;
-  const parts = String(token).split(".");
-  if (parts.length !== 2) return null;
-  const [payloadBase64, signature] = parts;
-  if (!safeEqual(signSessionPayload(payloadBase64), signature)) return null;
-
-  try {
-    const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
-    if (!payload.sub || !payload.exp || Number(payload.exp) < Math.floor(Date.now() / 1000)) {
-      return null;
-    }
-    return payload;
-  } catch {
-    return null;
-  }
-}
+const {create:createSessionToken,verify:verifySessionToken}=sessionCodec(SESSION_SECRET,SESSION_TTL_SECONDS);
 
 function getBearerToken(req) {
   const header = req.get("authorization") || "";
@@ -319,13 +281,14 @@ async function authenticateRequest(req, res, next) {
     if (!payload) return res.status(401).json({ error: "unauthorized" });
 
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation
        FROM users
        WHERE id=$1 AND COALESCE(is_active, true) = true`,
       [payload.sub]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "unauthorized" });
 
+    if (!sessionMatchesUser(payload,r.rows[0])) return res.status(401).json({error:'session revoked'});
     req.user = r.rows[0];
     req.isInternal = false;
     return next();
@@ -389,7 +352,7 @@ function requireInternal(req, res, next) {
 
 // ================== Telegram ==================
 async function sendTelegramMessage(chatId, text) {
-  if (!chatId || !TELEGRAM_BOT_TOKEN) return;
+  if (process.env.TELEGRAM_NOTIFICATIONS_ENABLED !== 'true' || !chatId || !TELEGRAM_BOT_TOKEN) return;
   try {
     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
@@ -621,7 +584,7 @@ app.post("/auth/login", rateLimitAuth, async (req, res) => {
   if (!login) return res.status(400).json({ error: "login is required" });
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin FROM users WHERE login = $1`,
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation FROM users WHERE login = $1`,
       [login]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
@@ -655,7 +618,7 @@ app.post("/auth/register-password", rateLimitAuth, async (req, res) => {
         (login, password_hash, name, role_text, telegram_id, is_superadmin, is_active, first_name, last_name, created_at)
       VALUES
         ($1, $2, $3, COALESCE($4,''), NULL, $5, true, '', '', NOW())
-      RETURNING id, login, name, role_text, telegram_id, is_superadmin
+      RETURNING id, login, name, role_text, telegram_id, is_superadmin, session_generation
       `,
       [login, passHash, name, role_text || "", isFirstUser]
     );
@@ -671,7 +634,7 @@ app.post("/auth/login-password", rateLimitAuth, async (req, res) => {
   if (!login || !password) return res.status(400).json({ error: "login and password are required" });
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin, password_hash FROM users WHERE login = $1`,
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation, password_hash FROM users WHERE login = $1`,
       [login]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
@@ -690,9 +653,10 @@ app.post("/auth/login-password", rateLimitAuth, async (req, res) => {
   }
 });
 
-app.post("/auth/logout", (req, res) => {
-  clearSessionCookie(res);
-  res.json({ ok: true });
+app.post('/auth/logout', requireUser, async (req,res) => {
+  try { await pool.query('UPDATE users SET session_generation=session_generation+1 WHERE id=$1',[req.user.id]);
+    clearSessionCookie(res); res.json({ok:true});
+  } catch { res.status(500).json({error:'Не удалось отозвать сессии'}); }
 });
 
 app.post("/auth/change-password", requireUser, async (req, res) => {
@@ -712,8 +676,9 @@ app.post("/auth/change-password", requireUser, async (req, res) => {
       return res.status(401).json({ error: "wrong password" });
     }
 
-    await pool.query(`UPDATE users SET password_hash=$1 WHERE id=$2`, [hashPassword(new_password), req.user.id]);
-    return sendSession(res, req.user);
+    const changed = await pool.query('UPDATE users SET password_hash=$1,session_generation=session_generation+1 WHERE id=$2 AND password_hash=$3 RETURNING session_generation',[hashPassword(new_password),req.user.id,user.password_hash]);
+    if (!changed.rowCount) return res.status(409).json({error:'Пароль уже изменился; войдите заново'});
+    return sendSession(res, {...req.user,session_generation:changed.rows[0].session_generation});
   } catch (e) {
     console.error("auth/change-password error:", e);
     res.status(500).json({ error: "db error" });
@@ -995,6 +960,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
       link_url: row.link_url,
       approved_hours: toNullableNumber(row.approved_hours),
       spent_hours: toNullableNumber(row.spent_hours),
+      deadline_confirmed: row.deadline_confirmed, next_action_at: row.next_action_at, next_action_text: row.next_action_text, reply_due_at: row.reply_due_at, waiting_for: row.waiting_for,
       created_at: row.created_at,
       updated_at: row.updated_at,
       assignee_name: row.assignee_name,
@@ -1069,111 +1035,17 @@ app.get("/exports/tasks/:jobId/download", requireUser, async (req, res) => {
   }
 });
 
-app.post("/tasks", requireEditor, async (req, res) => {
-  const {
-    id: clientId,            // пользовательский ID (необязателен, но можно передать)
-    title,
-    description,
-    email_thread,
-    document_history,
-    assignee_user_id,
-    start_at,
-    due_at,
-    link_url,
-    created_by,
-    priority,
-    status,
-    approved_hours,
-    spent_hours,
-  } = req.body;
-
-  if (!title) return res.status(400).json({ error: "title is required" });
-
-  try {
-    const approvedHours = parseOptionalHours(approved_hours);
-    const spentHours = parseOptionalHours(spent_hours);
-    if (Number.isNaN(approvedHours) || Number.isNaN(spentHours)) {
-      return res.status(400).json({ error: "hours must be non-negative numbers" });
-    }
-
-    const actorId = req.user?.id || toInt(created_by);
-    // Если ID передан — проверим уникальность
-    const idProvided = toInt(clientId);
-    if (idProvided != null) {
-      const exists = await pool.query(`SELECT 1 FROM tasks WHERE id = $1`, [idProvided]);
-      if (exists.rowCount > 0) return res.status(409).json({ error: "id_already_exists" });
-    }
-
-    let sql, params;
-    if (idProvided != null) {
-      sql = `
-        INSERT INTO tasks
-          (id, title, description, email_thread, document_history,
-           assignee_user_id, start_at, due_at, link_url,
-           created_by, updated_by, priority, status, approved_hours, spent_hours)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-           $10, $10, COALESCE($11,'low'), COALESCE($12,'не в работе'), $13, $14)
-        RETURNING id
-      `;
-      params = [
-        idProvided,
-        title,
-        cleanNullableText(description),
-        cleanNullableText(email_thread),
-        cleanNullableText(document_history),
-        toInt(assignee_user_id),
-        start_at || null,
-        due_at || null,
-        cleanNullableText(link_url),
-        actorId,
-        priority || null,
-        normalizeStatus(status) || "не в работе",
-        approvedHours,
-        spentHours,
-      ];
-    } else {
-      sql = `
-        INSERT INTO tasks
-          (title, description, email_thread, document_history,
-           assignee_user_id, start_at, due_at, link_url,
-           created_by, updated_by, priority, status, approved_hours, spent_hours)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8,
-           $9, $9, COALESCE($10,'low'), COALESCE($11,'не в работе'), $12, $13)
-        RETURNING id
-      `;
-      params = [
-        title,
-        cleanNullableText(description),
-        cleanNullableText(email_thread),
-        cleanNullableText(document_history),
-        toInt(assignee_user_id),
-        start_at || null,
-        due_at || null,
-        cleanNullableText(link_url),
-        actorId,
-        priority || null,
-        normalizeStatus(status) || "не в работе",
-        approvedHours,
-        spentHours,
-      ];
-    }
-
-    const insert = await pool.query(sql, params);
-    const taskId = insert.rows[0].id;
-
-    if (assignee_user_id) {
-      await notifyAssignee(assignee_user_id, `🆕 Новая задача #${taskId}: ${title}`);
-    }
-
-    res.status(201).json({ id: taskId });
-  } catch (e) {
-    console.error("POST /tasks error:", e);
-    res.status(500).json({ error: "db error" });
-  }
+app.post('/tasks', requireEditor, async (req,res) => {
+  try { const result=await transaction(pool,c=>writeTask(c,req.body.id,req.body,req.user,{creating:true}));
+    res.status(201).json(result.task);
+  } catch(e) { taskWriteError(res,e); }
 });
-
+function taskWriteError(res,e) {
+  if (e instanceof RequestError) return res.status(e.status).json({error:e.message});
+  if (e.code === '23505') return res.status(409).json({error:'ID уже существует'});
+  console.error('task write failed:',e.code || e.name);
+  return res.status(500).json({error:'Не удалось сохранить задачу'});
+}
 // ================== Task history ==================
 app.get("/tasks/:id/history", requireUser, async (req, res) => {
   const taskId = Number(req.params.id);
@@ -1196,144 +1068,9 @@ app.get("/tasks/:id/history", requireUser, async (req, res) => {
 });
 
 
-app.patch("/tasks/:id", requireEditor, async (req, res) => {
-  const taskId = Number(req.params.id);
-  const body = req.body || {};
-  const {
-    title,
-    description,
-    email_thread,
-    document_history,
-    status,
-    assignee_user_id,
-    start_at,
-    due_at,
-    link_url,
-    priority,
-    updated_by,
-    approved_hours,
-    spent_hours,
-  } = body;
-
-  try {
-    const current = await pool.query(
-      `SELECT * FROM tasks WHERE id = $1`,
-      [taskId]
-    );
-    if (current.rowCount === 0) return res.status(404).json({ error: "task not found" });
-    const before = current.rows[0];
-
-    const setParts = [];
-    const values = [];
-    const addSet = (field, value) => {
-      values.push(value);
-      setParts.push(`${field} = $${values.length}`);
-    };
-
-    if (hasOwn(body, "title")) {
-      const cleanTitle = cleanNullableText(title);
-      if (!cleanTitle) return res.status(400).json({ error: "title is required" });
-      addSet("title", cleanTitle);
-    }
-    if (hasOwn(body, "description")) addSet("description", cleanNullableText(description));
-    if (hasOwn(body, "email_thread")) addSet("email_thread", cleanNullableText(email_thread));
-    if (hasOwn(body, "document_history")) {
-      addSet("document_history", cleanNullableText(document_history));
-    }
-    if (hasOwn(body, "status")) addSet("status", normalizeStatus(status) || before.status);
-    if (hasOwn(body, "assignee_user_id")) addSet("assignee_user_id", toInt(assignee_user_id));
-    if (hasOwn(body, "start_at")) addSet("start_at", start_at || null);
-    if (hasOwn(body, "due_at")) addSet("due_at", due_at || null);
-    if (hasOwn(body, "link_url")) addSet("link_url", cleanNullableText(link_url));
-    if (hasOwn(body, "priority")) addSet("priority", cleanNullableText(priority) || before.priority);
-    if (hasOwn(body, "approved_hours")) {
-      const approvedHours = parseOptionalHours(approved_hours);
-      if (Number.isNaN(approvedHours)) {
-        return res.status(400).json({ error: "approved_hours must be a non-negative number" });
-      }
-      addSet("approved_hours", approvedHours);
-    }
-    if (hasOwn(body, "spent_hours")) {
-      const spentHours = parseOptionalHours(spent_hours);
-      if (Number.isNaN(spentHours)) {
-        return res.status(400).json({ error: "spent_hours must be a non-negative number" });
-      }
-      addSet("spent_hours", spentHours);
-    }
-
-    if (setParts.length === 0) {
-      return res.json({
-        ...before,
-        status: normalizeStatus(before.status),
-        approved_hours: toNullableNumber(before.approved_hours),
-        spent_hours: toNullableNumber(before.spent_hours),
-      });
-    }
-
-    addSet("updated_by", req.user.id || toInt(updated_by));
-    values.push(taskId);
-    const upd = await pool.query(
-      `
-      UPDATE tasks
-      SET
-        ${setParts.join(",\n        ")},
-        updated_at = NOW()
-      WHERE id = $${values.length}
-      RETURNING *
-      `,
-      values
-    );
-
-    const after = upd.rows[0];
-    // ==== log changes: status / start_at / due_at ====
-    const asIso = (v) => {
-      if (v == null) return null;
-      const d = v instanceof Date ? v : new Date(v);
-      return d.toISOString();
-    };
-
-    const beforeStart = asIso(before.start_at);
-    const afterStart = asIso(after.start_at);
-    const beforeDue = asIso(before.due_at);
-    const afterDue = asIso(after.due_at);
-    const beforeStatus = normalizeStatus(before.status);
-    const afterStatus = normalizeStatus(after.status);
-
-    const changes = [];
-    if (beforeStatus !== afterStatus) {
-      changes.push(["status", toStr(beforeStatus), toStr(afterStatus)]);
-    }
-    if (beforeStart !== afterStart) {
-      changes.push(["start_at", beforeStart, afterStart]);
-    }
-    if (beforeDue !== afterDue) {
-      changes.push(["due_at", beforeDue, afterDue]);
-    }
-
-    for (const [field, oldVal, newVal] of changes) {
-      await pool.query(
-        `INSERT INTO task_change_log (task_id, field_name, old_value, new_value)
-         VALUES ($1, $2, $3, $4)`,
-        [taskId, field, oldVal, newVal]
-      );
-    }
-
-
-    const nextAssigneeId = toInt(assignee_user_id);
-    if (hasOwn(body, "assignee_user_id") && nextAssigneeId && nextAssigneeId !== before.assignee_user_id) {
-      await notifyAssignee(nextAssigneeId, `📌 Вам назначена задача #${taskId}: ${after.title}`);
-    }
-
-    res.json({
-      ...after,
-      status: normalizeStatus(after.status),
-      approved_hours: toNullableNumber(after.approved_hours),
-      spent_hours: toNullableNumber(after.spent_hours),
-    });
-  } catch (e) {
-    console.error("PATCH /tasks/:id error:", e);
-    res.status(500).json({ error: "db error" });
-  }
+app.patch('/tasks/:id', requireEditor, async (req,res) => {
+  try { const result=await transaction(pool,c=>writeTask(c,req.params.id,req.body,req.user)); res.json(result.task); }
+  catch(e) { taskWriteError(res,e); }
 });
 
 app.delete("/tasks/:id", requireEditor, async (req, res) => {
@@ -1349,33 +1086,20 @@ app.delete("/tasks/:id", requireEditor, async (req, res) => {
 });
 
 app.post("/tasks/:id/tags", requireEditor, async (req, res) => {
-  const taskId = Number(req.params.id);
-  const { tag_id } = req.body;
-  if (!tag_id) return res.status(400).json({ error: "tag_id is required" });
   try {
-    await pool.query(
-      `INSERT INTO task_tags (task_id, tag_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-      [taskId, tag_id]
-    );
+    await transaction(pool,c=>setTaskTag(c,req.params.id,req.body.tag_id,true,req.user));
     res.json({ ok: true });
-  } catch (e) {
-    console.error("POST /tasks/:id/tags error:", e);
-    res.status(500).json({ error: "db error" });
-  }
+  } catch (e) { taskWriteError(res,e); }
 });
 
 app.delete("/tasks/:id/tags/:tagId", requireEditor, async (req, res) => {
-  const taskId = Number(req.params.id);
-  const tagId = Number(req.params.tagId);
   try {
-    await pool.query(`DELETE FROM task_tags WHERE task_id=$1 AND tag_id=$2`, [taskId, tagId]);
+    await transaction(pool,c=>setTaskTag(c,req.params.id,req.params.tagId,false,req.user));
     res.json({ ok: true });
-  } catch (e) {
-    console.error("DELETE /tasks/:id/tags/:tagId error:", e);
-    res.status(500).json({ error: "db error" });
-  }
+  } catch (e) { taskWriteError(res,e); }
 });
 
 // ==================
+registerTrackerRoutes(app,{pool,requireUser,requireEditor});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API listening on port", PORT));
