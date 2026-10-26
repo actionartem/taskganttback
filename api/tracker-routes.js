@@ -23,6 +23,8 @@ import {
   DOCUMENT_COLUMNS,
   validateDocument,
   insertDocument,
+  validateApprovedDocument,
+  replaceApprovedDocument,
 } from "./tracker-documents.js";
 import { saveJiraSnapshot } from "./tracker-jira.js";
 import { readHoursFacts } from "./tracker-hours.js";
@@ -224,7 +226,9 @@ export function registerTrackerRoutes(
     res.json(
       (
         await pool.query(
-          `SELECT ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) ORDER BY received_at DESC,id DESC`,
+          req.query.latest === "approved"
+            ? `SELECT DISTINCT ON (task_id) ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) AND approved_at IS NOT NULL ORDER BY task_id,approved_at DESC,received_at DESC,id DESC`
+            : `SELECT ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) ORDER BY received_at DESC,id DESC`,
           [taskId],
         )
       ).rows,
@@ -233,6 +237,16 @@ export function registerTrackerRoutes(
   app.get("/documents", requireUser, documentRead);
   app.get("/tasks/:id/documents", requireUser, documentRead);
   app.get("/integrations/agent/tasks/:id/documents", agent, documentRead);
+  const approvedDocumentWrite = handler(async (req, res) => {
+    const event = eventFor(req), taskId = positiveId(req.params.id);
+    if (event.type !== "document.approved") fail("Ожидается событие document.approved");
+    const doc = validateApprovedDocument(req.body.document);
+    const result = await applyExternal(pool, taskId, event, null, { ...doc, file_bytes: undefined }, async (client, r) => ({ document: await replaceApprovedDocument(client, taskId, r.event.id, doc) }));
+    if (result.duplicate) result.document = (await pool.query(`SELECT ${DOCUMENT_COLUMNS} FROM task_documents WHERE event_id=$1`, [result.event.id])).rows[0];
+    res.status(result.duplicate ? 200 : 201).json(result);
+  });
+  app.post("/tasks/:id/documents/approved", requireEditor, approvedDocumentWrite);
+  app.post("/integrations/agent/tasks/:id/documents/approved", agent, approvedDocumentWrite);
   const documentWrite = handler(async (req, res) => {
     const doc = validateDocument(req.body.document),
       event = eventFor(req),

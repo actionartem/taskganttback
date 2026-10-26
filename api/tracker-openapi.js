@@ -8,6 +8,7 @@ const id = {
 };
 const security = [{ bearerAuth: [] }, { sessionCookie: [] }];
 const integration = [{ agentToken: [] }];
+const latestApproved = { name: "latest", in: "query", schema: { type: "string", enum: ["approved"] }, description: "Один последний согласованный документ на задачу" };
 const event = {
   type: "object",
   required: ["external_id", "type", "summary"],
@@ -121,6 +122,19 @@ export function extendTrackerSpec(definition) {
         },
       },
     },
+    ApprovedDocumentInput: {
+      type: "object",
+      required: ["title", "approved_at"],
+      properties: {
+        title: { type: "string" },
+        approved_at: { type: "string", format: "date-time", description: "Подтверждённая дата согласования, не в будущем" },
+        approval_evidence: { type: "string" },
+        version: { type: "string", description: "Необязательный идентификатор версии источника" },
+        source_url: { type: "string", format: "uri", nullable: true },
+        file_name: { type: "string" },
+        file_base64: { type: "string", format: "byte", description: "Файл до 10 МиБ. Нужен файл либо source_url." },
+      },
+    },
     JiraSnapshot: {
       type: "object",
       required: [
@@ -202,7 +216,7 @@ export function extendTrackerSpec(definition) {
       }),
     },
     "/integrations/agent/tasks/{id}/documents": {
-      get: operation("Прочитать все версии документов"),
+      get: { ...operation("Документы; latest=approved возвращает последний согласованный"), parameters: [id, latestApproved] },
       post: operation("Зарегистрировать новую версию и событие", {
         type: "object",
         required: ["event", "document"],
@@ -210,6 +224,12 @@ export function extendTrackerSpec(definition) {
           event: ref("ExternalEvent"),
           document: ref("DocumentInput"),
         },
+      }),
+    },
+    "/integrations/agent/tasks/{id}/documents/approved": {
+      post: operation("Заменить последний согласованный документ; событие document.approved", {
+        type: "object", required: ["event", "document"],
+        properties: { event: ref("ExternalEvent"), document: ref("ApprovedDocumentInput") },
       }),
     },
     "/integrations/agent/tasks/{id}/documents/{docId}/state": {
@@ -276,13 +296,14 @@ export function extendTrackerSpec(definition) {
     },
     "/documents": {
       get: {
-        ...operation("Все зарегистрированные документы", null, security),
-        parameters: [],
+        ...operation("Документы; latest=approved возвращает один согласованный на задачу", null, security),
+        parameters: [latestApproved],
       },
     },
   });
   for (const suffix of [
     "documents",
+    "documents/approved",
     "documents/{docId}/state",
     "documents/{docId}/download",
   ]) {

@@ -70,3 +70,18 @@ export async function insertDocument(client, taskId, eventId, doc) {
   );
   return result.rows[0];
 }
+
+export function validateApprovedDocument(body) {
+  const approvedAt = date(body?.approved_at);
+  if (!approvedAt || new Date(approvedAt) > new Date()) fail("Укажите дату согласования, не позднее сегодняшней");
+  return { ...validateDocument({ ...body, kind: "other", version: body.version || "approved" }),
+    approved_at: approvedAt, approval_evidence: text(body.approval_evidence, 4000) || "Добавлен как согласованный документ" };
+}
+
+export async function replaceApprovedDocument(client, taskId, eventId, doc) {
+  // applyExternal holds the task row lock: publication and history are atomic.
+  const latest = (await client.query("SELECT max(approved_at) AS approved_at FROM task_documents WHERE task_id=$1", [taskId])).rows[0]?.approved_at;
+  if (latest && new Date(latest) > new Date(doc.approved_at)) fail("У задачи уже есть документ с более поздней датой согласования", 409);
+  await client.query("UPDATE task_documents SET is_current=false WHERE task_id=$1 AND is_current=true", [taskId]);
+  return insertDocument(client, taskId, eventId, { ...doc, is_current: true });
+}

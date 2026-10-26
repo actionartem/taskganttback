@@ -145,6 +145,38 @@ test('explicit pauses are counted separately, completed work closes pause and un
   assert.throws(()=>externalEvent({external_id:'pause',type:'task.paused',summary:'Причина'},'mail-agent','mail-agent'));
 });
 
+test('latest approved document replaces all kinds atomically, deduplicates and rejects stale approvals',async()=>{
+  const taskId='91001';
+  await transaction(pool,c=>writeTask(c,taskId,{title:'Approved document test'},{id:'1'},{creating:true}));
+  const post=async(body,headers={'x-integration-token':'test-agent'})=>fetch(`${base}/integrations/agent/tasks/${taskId}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});
+  const payload={event:{external_id:'approved-only-1',type:'document.approved',summary:'ДИТ согласовал'},document:{title:'Согласовано',approved_at:'2026-10-24T10:00:00Z',file_name:'approved.txt',file_base64:Buffer.from('approved first').toString('base64')}};
+  assert.equal((await post(payload,{})).status,401);
+  assert.equal((await post({...payload,document:{...payload.document,approved_at:null}})).status,400);
+  assert.equal((await post({...payload,document:{...payload.document,approved_at:'2099-01-01'}})).status,400);
+  const first=await post(payload);assert.equal(first.status,201);const a=await first.json();
+  assert.equal(a.document.is_current,true);assert.ok(a.document.approved_at);
+  const retry=await post(payload);assert.equal(retry.status,200);assert.equal((await retry.json()).document.id,a.document.id);
+  const secondPayload={...payload,event:{...payload.event,external_id:'approved-only-2'},document:{...payload.document,title:'Последний согласованный',approved_at:'2026-10-25T10:00:00Z'}};
+  const second=await post(secondPayload);assert.equal(second.status,201);const b=await second.json();
+  // A late draft from the compatibility API must never replace an approved file.
+  const draft=await fetch(`${base}/integrations/agent/tasks/${taskId}/documents`,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-agent'},body:JSON.stringify({event:{external_id:'approved-late-draft',type:'document.received',summary:'Черновик'},document:{kind:'az',title:'Черновик',version:'future',source_url:'https://example.test/draft'}})});
+  assert.equal(draft.status,201);
+  const read=await fetch(`${base}/tasks/${taskId}/documents?latest=approved`,{headers:{Authorization:'Bearer test-user'}});
+  const visible=await read.json();assert.equal(visible.length,1);assert.equal(visible[0].id,b.document.id);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM task_documents WHERE task_id=$1 AND is_current=true',[taskId])).rows[0].n,1);
+  const before=(await readEvents(pool,taskId)).length;
+  assert.equal((await post({...payload,event:{...payload.event,external_id:'approved-stale'}})).status,409);
+  assert.equal((await readEvents(pool,taskId)).length,before);
+  const all=await (await fetch(`${base}/documents?latest=approved`,{headers:{Authorization:'Bearer test-user'}})).json();
+  assert.equal(all.filter(d=>String(d.task_id)===taskId).length,1);
+  const downloaded=await fetch(`${base}/tasks/${taskId}/documents/${b.document.id}/download`,{headers:{Authorization:'Bearer test-user'}});
+  assert.equal(await downloaded.text(),'approved first');
+  const ui=await fetch(`${base}/tasks/${taskId}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer test-user'},body:JSON.stringify({...secondPayload,event:{...payload.event,external_id:'approved-ui'}})});
+  assert.equal(ui.status,201);
+  const equalDate=await (await fetch(`${base}/tasks/${taskId}/documents?latest=approved`,{headers:{Authorization:'Bearer test-user'}})).json();
+  assert.equal(equalDate[0].id,(await ui.json()).document.id);
+});
+
 test('compatibility tag endpoints use the same atomic journal; untouched fields survive a narrow patch',async()=>{
   await transaction(pool,c=>writeTask(c,'10001',{description:'Обновлено агентом'},{id:'1'}));
   await transaction(pool,c=>writeTask(c,'10001',{title:'Ручное название'},{id:'1'}));

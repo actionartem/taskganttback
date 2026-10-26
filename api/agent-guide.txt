@@ -26,7 +26,7 @@ GET /integrations/agent/tasks?q=ECHD-12345
 Поиск по точному ID/ключу Jira либо части названия; до 200 результатов.
 GET /integrations/agent/tasks/12345
 GET /integrations/agent/tasks/12345/events
-GET /integrations/agent/tasks/12345/documents
+GET /integrations/agent/tasks/12345/documents?latest=approved
 GET /integrations/agent/options — активные исполнители (id/name), теги,
 допустимые статусы и приоритеты; без паролей и реквизитов пользователей.
 При неоднозначной привязке остановите импорт этой записи для сверки.
@@ -94,23 +94,29 @@ reply_due_at — отдельные точные моменты. После де
 передайте соответствующее поле null; одна заметка сигнал не снимает.
 Не переносите due_at ради откладывания напоминания.
 
-5. ДОКУМЕНТЫ
-POST /integrations/agent/tasks/12345/documents
+5. ПОСЛЕДНИЙ СОГЛАСОВАННЫЙ ДОКУМЕНТ
+В карточке и разделе документов показывается один последний согласованный
+документ на задачу, без видов и списка версий. Передавайте только подтверждённо
+согласованные файлы. Черновики и замечания описывайте событиями истории.
+POST /integrations/agent/tasks/12345/documents/approved
 {
   "event": {
     "external_id": "mail:stable-message-id:attachment:sha256-value",
-    "type": "document.received",
-    "summary": "Получена АЗ v1.3 с комментариями ДИТ",
+    "type": "document.approved",
+    "summary": "ДИТ согласовал описание интеграции",
     "actor_name": "ДИТ",
-    "occurred_at": null
+    "occurred_at": "2026-10-25T14:00:00+03:00"
   },
   "document": {
-    "kind": "az", "title": "Описание интеграции", "version": "1.3",
-    "document_date": "2026-10-26",
+    "title": "Описание интеграции",
+    "approved_at": "2026-10-25T14:00:00+03:00",
+    "approval_evidence": "Письмо ДИТ от 25.10.2026, ссылка/идентификатор",
     "source_url": "https://example.invalid/document/123"
   }
 }
-kind: az / st / estimate / other. Нужен source_url либо файл: file_name и
+Вид не передаётся. version необязательна и нужна только для идентификатора
+источника. approved_at обязательна: нельзя подменять неизвестное время
+согласования временем загрузки. Нужен source_url либо файл: file_name и
 file_base64. Файл 1 байт..10 МиБ, PDF/DOC/DOCX/XLS/XLSX/TXT/PNG/JPEG.
 Файлы хранятся в PostgreSQL, а не во временном слое контейнера. Ответ
 содержит document.id и SHA-256 файла. Проверьте чтение списка и
@@ -118,25 +124,15 @@ GET /integrations/agent/tasks/12345/documents/DOC_ID/download.
 Маршрут скачивания требует ключ и проверяет принадлежность задаче.
 Для версии только со ссылкой локального скачивания нет.
 
-Новая версия всегда is_current:false, approved_at:null. Дата загрузки не
-доказывает актуальность. Для подтверждённой рабочей версии:
-POST /integrations/agent/tasks/12345/documents/DOC_ID/state
-{
-  "event": {"external_id":"decision:123:current", "type":"document.current",
-    "summary":"Подтверждена рабочая версия АЗ v1.3", "occurred_at":null},
-  "state": {"is_current":true}
-}
-Актуальной становится одна версия этого вида в задаче; другие версии и
-их согласования сохраняются. Для согласования конкретной версии:
-{
-  "event": {"external_id":"mail:approval:123", "type":"document.approved",
-    "summary":"ДИТ согласовал АЗ v1.2", "actor_name":"ДИТ",
-    "occurred_at":"2026-10-25T14:00:00+03:00"},
-  "state": {"approved_at":"2026-10-25T14:00:00+03:00",
-    "approval_evidence":"Письмо ДИТ от 25.10.2026, ссылка/идентификатор"}
-}
-Без времени и основания согласование не записывается. Новая v1.3 не
-наследует согласование v1.2. Не выбирайте актуальную версию по загрузке.
+Файл, согласование и история сохраняются одной транзакцией. Новая запись
+становится текущей для всей задачи. Повтор запроса с тем же external_id и
+содержимым не создаёт дубликат. Более ранняя дата согласования, чем у уже
+сохранённого документа, возвращает 409 и ничего не меняет. При равной дате
+последняя явно присланная запись заменяет предыдущую.
+Проверка: GET /integrations/agent/tasks/12345/documents?latest=approved.
+Старые записи сохранены для истории и совместимости; прежние маршруты
+/documents и /documents/DOC_ID/state остаются доступны прежним интеграциям.
+Для новой работы используйте /documents/approved. Не загружайте архив версий.
 
 6. JIRA — ОТДЕЛЬНЫЙ СНИМОК И ИСТОРИЯ
 POST /integrations/jira/tasks/12345/snapshot

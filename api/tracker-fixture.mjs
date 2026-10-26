@@ -6,7 +6,7 @@ import fs from 'node:fs/promises';
 import {transaction,writeTask,getTask,applyExternal} from './tracker-store.js';
 import {externalEvent} from './tracker-domain.js';
 import {saveJiraSnapshot} from './tracker-jira.js';
-import {validateDocument,insertDocument} from './tracker-documents.js';
+import {validateDocument,insertDocument,validateApprovedDocument,replaceApprovedDocument} from './tracker-documents.js';
 import {registerTrackerRoutes,handler} from './tracker-routes.js';
 import {setupSwagger} from './swagger.js';
 const db=new PGlite();
@@ -29,6 +29,13 @@ await saveJiraSnapshot(pool,'10001',{issue_id:'synthetic-42',issue_key:'ECHD-42'
 const doc=validateDocument({kind:'az',title:'Описание интеграции',version:'1.3',source_url:'https://example.invalid/docs/v1.3'});
 await applyExternal(pool,'10001',externalEvent({external_id:'synthetic-doc-13',type:'document.received',summary:'Маша прислала новую АЗ v1.3',actor_name:'Аналитик Маша',occurred_at:'2026-10-26T08:00:00Z'},'mail-agent','mail-agent'),null,{doc},(c,r)=>insertDocument(c,'10001',r.event.id,doc));
 await transaction(pool,c=>writeTask(c,'10001',{reply_due_at:'2026-10-25T15:00:00Z',waiting_for:'ДИТ',next_action_text:'Уточнить срок ответа по АЗ'},user));
+for (const [id,title,at] of [['synthetic-approved-1','Предыдущий согласованный','2026-10-24T10:00:00Z'],['synthetic-approved-2','Последний согласованный документ','2026-10-25T10:00:00Z']]) {
+  const approved=validateApprovedDocument({title,approved_at:at,file_name:'approved.txt',file_base64:Buffer.from(title).toString('base64')});
+  await applyExternal(pool,'10001',externalEvent({external_id:id,type:'document.approved',summary:title,occurred_at:at},'mail-agent','mail-agent'),null,{approved},(c,r)=>replaceApprovedDocument(c,'10001',r.event.id,approved));
+}
+if (process.env.FIXTURE_LARGE === '1') {
+  for(let i=21;i<77;i++) await transaction(pool,c=>writeTask(c,String(10001+i),{title:`Проверка производительности ${i}`,status:statuses[i%7],start_at:`${2025+i%4}-01-05`,due_at:`${2025+i%4}-12-20`,approved_hours:80},user,{creating:true}));
+}
 const app=express();app.use(cors({origin:'http://localhost:3015',credentials:true}));app.use(express.json({limit:'15mb'}));
 const auth=(req,res,next)=>{if(req.get('authorization')!=='Bearer local-fixture-only')return res.status(401).json({error:'test session required'});req.user=user;next()};
 app.post('/auth/login-password',(req,res)=>res.json(user));app.post('/auth/logout',auth,(req,res)=>res.json({ok:true}));
