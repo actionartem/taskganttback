@@ -25,6 +25,7 @@ import {
   insertDocument,
 } from "./tracker-documents.js";
 import { saveJiraSnapshot } from "./tracker-jira.js";
+import { readHoursFacts } from "./tracker-hours.js";
 
 const safeEqual = (a, b) =>
   typeof a === "string" &&
@@ -48,6 +49,9 @@ export function registerTrackerRoutes(
   app,
   { pool, requireUser, requireEditor, env = process.env },
 ) {
+  app.get("/statistics/hours", requireUser, handler(async (_req, res) => {
+    res.json({ items: await readHoursFacts(pool), time_zone: "Europe/Moscow" });
+  }));
   app.get("/integrations/guide", (req, res) =>
     res
       .type("text/plain; charset=utf-8")

@@ -96,7 +96,6 @@ export function extendTrackerSpec(definition) {
         due_at: { type: "string", format: "date-time", nullable: true },
         link_url: { type: "string", format: "uri", nullable: true },
         approved_hours: { type: "number", minimum: 0, nullable: true },
-        spent_hours: { type: "number", minimum: 0, nullable: true },
         tags: { type: "array", items: { type: "string" } },
         deadline_confirmed: { type: "boolean" },
         next_action_at: { type: "string", format: "date-time", nullable: true },
@@ -305,6 +304,25 @@ export function extendTrackerSpec(definition) {
     get: {
       ...operation("Полученные снимки Jira", null, security),
       parameters: [],
+    },
+  };
+  definition.paths["/statistics/hours"] = {
+    get: {
+      ...operation("Даты для статистики часов: факт завершения по истории, план релиза из due_at; календарь Europe/Moscow", null, security),
+      parameters: [],
+      responses: {
+        200: { description: "Отсутствующие или недостоверные даты возвращаются как null", content: json({
+          type: "object", properties: {
+            time_zone: { type: "string", example: "Europe/Moscow" },
+            items: { type: "array", items: { type: "object", properties: {
+              task_id: { type: "string" },
+              completed_on: { type: "string", format: "date", nullable: true },
+              planned_release_on: { type: "string", format: "date", nullable: true },
+            } } },
+          },
+        }) },
+        401: { description: "Требуется сессия пользователя" },
+      },
     },
   };
   definition.paths["/tasks/{id}/jira"] = {

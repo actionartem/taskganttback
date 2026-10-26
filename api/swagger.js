@@ -84,7 +84,6 @@ export function setupSwagger(app) {
               due_at: { type: "string", format: "date-time", nullable: true },
               link_url: { type: "string", nullable: true },
               approved_hours: { type: "number", nullable: true },
-              spent_hours: { type: "number", nullable: true },
               created_at: { type: "string", format: "date-time" },
               updated_at: { type: "string", format: "date-time" },
               assignee_name: { type: "string", nullable: true },
@@ -117,7 +116,6 @@ export function setupSwagger(app) {
               due_at: { type: "string", format: "date-time", nullable: true },
               link_url: { type: "string", nullable: true },
               approved_hours: { type: "number", nullable: true },
-              spent_hours: { type: "number", nullable: true },
             },
           },
           MailEventRequest: {
@@ -206,7 +204,6 @@ export function setupSwagger(app) {
                     "priority",
                     "assignee",
                     "approved_hours",
-                    "spent_hours",
                     "link_url",
                     "start_at",
                     "due_at",

@@ -129,7 +129,6 @@ const TASK_EXPORT_FIELDS = [
   { key: "priority", label: "Приоритет", width: 14, type: "text" },
   { key: "assignee", label: "Исполнитель", width: 22, type: "text" },
   { key: "approved_hours", label: "Согласовано часов", width: 18, type: "number" },
-  { key: "spent_hours", label: "Затрачено часов", width: 18, type: "number" },
   { key: "link_url", label: "Ссылка на задачу в JIRA", width: 42, type: "link" },
   { key: "start_at", label: "Дата начала", width: 14, type: "date" },
   { key: "due_at", label: "Дата окончания", width: 16, type: "date" },

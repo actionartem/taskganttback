@@ -34,6 +34,23 @@ before(async()=>{
 });
 after(async()=>{await new Promise(resolve=>server?.close(resolve));await db?.close();});
 const event=(id,type='note')=>externalEvent({external_id:id,type,summary:'ДИТ согласовал документ',actor_name:'ДИТ',source_url:'https://example.test/mail/1'},'mail-agent','mail-agent');
+test('hours facts are authenticated, combine legacy and new journals, and expose only known completion dates',async()=>{
+  await pool.query("INSERT INTO tasks(id,title,status,due_at) VALUES(90001,'Hours legacy','done','2025-12-31T22:00:00Z'),(90002,'Hours unknown','завершена','2025-10-01'),(90003,'Hours planned','разработка','2027-02-22')");
+  await pool.query("INSERT INTO task_change_log(task_id,field_name,old_value,new_value,changed_at) VALUES(90001,'status','разработка','done','2025-12-31T22:00:00Z')");
+  await transaction(pool,c=>writeTask(c,'90004',{title:'Hours new',status:'завершена'},{id:'1'},{creating:true}));
+  assert.equal((await fetch(`${base}/statistics/hours`)).status,401);
+  const response=await fetch(`${base}/statistics/hours`,{headers:{Authorization:'Bearer test-user'}});
+  assert.equal(response.status,200);
+  const body=await response.json(), byId=new Map(body.items.map(i=>[i.task_id,i]));
+  assert.equal(body.time_zone,'Europe/Moscow');
+  assert.equal(byId.get('90001').completed_on,'2026-01-01');
+  assert.equal(byId.get('90001').planned_release_on,'2026-01-01');
+  assert.equal(byId.get('90002').completed_on,null);
+  assert.equal(byId.get('90003').completed_on,null);
+  assert.equal(byId.get('90003').planned_release_on,'2027-02-22');
+  assert.match(byId.get('90004').completed_on,/^\d{4}-\d{2}-\d{2}$/);
+  await pool.query('DELETE FROM tasks WHERE id BETWEEN 90001 AND 90004');
+});
 test('task, tags, legacy journal and event commit together; failed history rolls everything back',async()=>{
   await transaction(pool,c=>writeTask(c,'10001',{title:'Исходная',status:'разработка',tags:['API']},{id:'1',name:'Тест'},{creating:true}));
   assert.equal((await getTask(pool,'10001')).tags[0].title,'API');
