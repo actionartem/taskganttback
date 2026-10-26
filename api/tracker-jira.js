@@ -5,6 +5,7 @@ import {
   url,
   date,
   fingerprint,
+  requireAutomation,
 } from "./tracker-domain.js";
 import {
   transaction,
@@ -61,7 +62,7 @@ export function jiraSnapshot(body) {
 export async function saveJiraSnapshot(pool, taskId, body, recorder) {
   const snapshot = jiraSnapshot(body);
   return transaction(pool, async (c) => {
-    await getTask(c, taskId, true);
+    requireAutomation(await getTask(c, taskId, true));
     const old = (
       await c.query("SELECT * FROM task_jira WHERE task_id=$1", [taskId])
     ).rows[0];

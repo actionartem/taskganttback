@@ -11,6 +11,7 @@ import {
   STAGES,
   stageDurations,
   attentionReasons,
+  automationBlock,
 } from "./tracker-domain.js";
 import {
   transaction,
@@ -28,6 +29,7 @@ import {
 } from "./tracker-documents.js";
 import { saveJiraSnapshot } from "./tracker-jira.js";
 import { readHoursFacts } from "./tracker-hours.js";
+import { readAnalysis, saveAnalysisMail, saveAzSnapshot, primaryJira } from "./tracker-analysis.js";
 
 const safeEqual = (a, b) =>
   typeof a === "string" &&
@@ -96,10 +98,8 @@ export function registerTrackerRoutes(
     );
   const taskRead = handler(async (req, res) => {
     const task = await getTask(pool, req.params.id);
-    const snapshot =
-      (await pool.query("SELECT * FROM task_jira WHERE task_id=$1", [task.id]))
-        .rows[0] || null;
-    res.json({ ...task, jira: snapshot });
+    const snapshot = await primaryJira(pool, task.id);
+    res.json({ ...task, jira: snapshot, automation_blocked_reason: automationBlock(task) });
   });
   app.get("/tasks/:id", requireUser, taskRead);
   app.get("/integrations/agent/tasks/:id", agent, taskRead);
@@ -111,11 +111,13 @@ export function registerTrackerRoutes(
       res.json(
         (
           await pool.query(
-            `SELECT t.id,t.title,t.email_thread,j.issue_key FROM tasks t LEFT JOIN task_jira j ON j.task_id=t.id
-      WHERE $1='' OR t.id::text=$1 OR j.issue_key=$1 OR t.title ILIKE '%'||$1||'%' ORDER BY t.id LIMIT 200`,
+            `SELECT t.id,t.title,t.email_thread,t.status,t.automation_locked,t.link_url,
+              COALESCE(a.issue_key,j.issue_key) AS issue_key,a.issue_key AS az_issue_key,a.epic_key
+              FROM tasks t LEFT JOIN task_jira j ON j.task_id=t.id LEFT JOIN task_az a ON a.task_id=t.id
+      WHERE $1='' OR t.id::text=$1 OR j.issue_key=$1 OR a.issue_key=$1 OR a.epic_key=$1 OR t.title ILIKE '%'||$1||'%' ORDER BY t.id LIMIT 200`,
             [q],
           )
-        ).rows,
+        ).rows.map(task => ({ ...task, automation_blocked_reason: automationBlock(task) })),
       );
     }),
   );
@@ -151,16 +153,25 @@ export function registerTrackerRoutes(
   app.post("/integrations/agent/tasks/:id/actions", agent, actionWrite);
   app.post("/tasks/:id/events", requireEditor, eventWrite);
 
+  const analysisRead = handler(async (req,res) => res.json(await readAnalysis(pool,positiveId(req.params.id))));
+  app.get("/tasks/:id/analysis", requireUser, analysisRead);
+  app.get("/integrations/agent/tasks/:id/analysis", agent, analysisRead);
+  app.post("/integrations/agent/tasks/:id/analysis/events", agent, handler(async (req,res) => {
+    const result = await saveAnalysisMail(pool,positiveId(req.params.id),req.body);
+    res.status(result.duplicate ? 200 : 201).json(result);
+  }));
+  app.post("/integrations/jira/tasks/:id/analysis", jiraAgent, handler(async (req,res) => {
+    res.json(await saveAzSnapshot(pool,positiveId(req.params.id),req.body));
+  }));
+
   app.get(
     "/jira",
     requireUser,
-    handler(async (req, res) =>
-      res.json({
-        delivery: "agent",
-        items: (await pool.query("SELECT * FROM task_jira ORDER BY task_id"))
-          .rows,
-      }),
-    ),
+    handler(async (req, res) => {
+      const az = (await pool.query("SELECT *, 'az' AS issue_role FROM task_az ORDER BY task_id")).rows;
+      const legacy = (await pool.query("SELECT j.*, 'legacy' AS issue_role FROM task_jira j WHERE NOT EXISTS (SELECT 1 FROM task_az a WHERE a.task_id=j.task_id) ORDER BY task_id")).rows;
+      res.json({ delivery: "agent", items: [...az, ...legacy] });
+    }),
   );
   app.put(
     "/tasks/:id/jira",

@@ -14,6 +14,7 @@ import {saveJiraSnapshot} from './tracker-jira.js';
 import {registerTrackerRoutes} from './tracker-routes.js';
 import {sessionCodec,sessionMatchesUser} from './tracker-session.js';
 import {setupSwagger} from './swagger.js';
+import {saveAzSnapshot,saveAnalysisMail,readAnalysis} from './tracker-analysis.js';
 let db,pool,server,base;
 before(async()=>{
   db=new PGlite();await db.exec(`CREATE TABLE users(id BIGSERIAL PRIMARY KEY,name text,role_text text,is_active boolean DEFAULT true);
@@ -24,6 +25,8 @@ before(async()=>{
     INSERT INTO users(name) VALUES('Тест'); INSERT INTO tags(title,color) VALUES('API','#123456');`);
   const sql=await fs.readFile(new URL('../migrations/20261026_tracker_v2.sql',import.meta.url),'utf8');
   await db.exec(sql);await db.exec(sql); // additive, rerunnable migration
+  const analysisSql=await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8');
+  await db.exec(analysisSql);await db.exec(analysisSql);
   const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows ?? r.rows.length};};
   pool={query,connect:async()=>({query,release(){}})};
   const app=express();app.use(express.json({limit:'15mb'}));
@@ -52,7 +55,7 @@ test('hours facts are authenticated, combine legacy and new journals, and expose
   await pool.query('DELETE FROM tasks WHERE id BETWEEN 90001 AND 90004');
 });
 test('task, tags, legacy journal and event commit together; failed history rolls everything back',async()=>{
-  await transaction(pool,c=>writeTask(c,'10001',{title:'Исходная',status:'разработка',tags:['API']},{id:'1',name:'Тест'},{creating:true}));
+  await transaction(pool,c=>writeTask(c,'10001',{title:'Исходная',status:'в аналитике',tags:['API']},{id:'1',name:'Тест'},{creating:true}));
   assert.equal((await getTask(pool,'10001')).tags[0].title,'API');
   const count=(await readEvents(pool,'10001')).length;
   await assert.rejects(transaction(pool,async c=>{
@@ -67,10 +70,10 @@ test('external idempotency, conflicting retry and explicit changes only',async()
   const original=await applyExternal(pool,'10001',event('mail-1'),null);
   const duplicate=await applyExternal(pool,'10001',event('mail-1'),null);
   assert.equal(duplicate.duplicate,true);assert.equal(duplicate.event.id,original.event.id);
-  assert.equal((await getTask(pool,'10001')).status,'разработка');
+  assert.equal((await getTask(pool,'10001')).status,'в аналитике');
   await assert.rejects(applyExternal(pool,'10001',{...event('mail-1'),summary:'Другое'},null),e=>e.status===409);
   const changed=await applyExternal(pool,'10001',event('mail-2','task.updated'),{status:'на согласовании'});
-  assert.equal(changed.task.status,'на согласовании');assert.equal(changed.event.changes.status.old,'разработка');
+  assert.equal(changed.task.status,'на согласовании');assert.equal(changed.event.changes.status.old,'в аналитике');
   assert.equal(changed.event.occurred_at,null);assert.ok(changed.event.received_at);
 });
 test('reject invalid enum, dates, hours, missing relations and bad IDs',async()=>{
@@ -112,7 +115,8 @@ test('attention requires explicit promise; unknown history and old queue do not 
   assert.deepEqual(attentionReasons({status:'готова к разработке',due_at:'2025-01-01'},m,{},now),[]);
   assert.equal(attentionReasons({status:'разработка',assignee_user_id:1},m,{'разработка':3},now).length,0);
   assert.equal(attentionReasons({status:'разработка',deadline_confirmed:true,due_at:'2026-10-26',assignee_user_id:1},m,{},now).length,0);
-  assert.equal(attentionReasons({status:'разработка',deadline_confirmed:true,due_at:'2026-10-25',assignee_user_id:1},m,{},now)[0].code,'deadline');
+  assert.equal(attentionReasons({status:'в аналитике',deadline_confirmed:true,due_at:'2026-10-25',assignee_user_id:1},m,{},now)[0].code,'deadline');
+  assert.deepEqual(attentionReasons({status:'разработка',deadline_confirmed:true,due_at:'2026-10-25'},m,{},now),[]);
 });
 test('HTTP integration permissions and actor provenance',async()=>{
   assert.equal((await fetch(`${base}/integrations/agent/tasks`)).status,401);
@@ -223,7 +227,7 @@ test('existing Excel export still filters, writes and reads a workbook using the
 
 test('agent guide and OpenAPI are discoverable; catalogs exclude credentials',async()=>{
   const guide=await fetch(base+'/integrations/guide');assert.equal(guide.status,200);assert.match(await guide.text(),/JIRA_INGEST_TOKEN/);
-  const spec=await (await fetch(base+'/openapi.json')).json();assert.equal(spec.info.version,'2.0.0');assert.ok(spec.paths['/integrations/jira/tasks/{id}/snapshot'].post);
+  const spec=await (await fetch(base+'/openapi.json')).json();assert.equal(spec.info.version,'2.1.0');assert.ok(spec.paths['/integrations/jira/tasks/{id}/analysis'].post);
   assert.equal((await fetch(base+'/integrations/agent/options')).status,401);
   const options=await (await fetch(base+'/integrations/agent/options',{headers:{'x-integration-token':'test-agent'}})).json();
   assert.deepEqual(Object.keys(options.users[0]).sort(),['id','name']);assert.ok(options.statuses.includes('разработка'));
@@ -240,4 +244,60 @@ test('deleting a task cascades its events, corrections, versions and personal si
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM task_events WHERE task_id=99999')).rows[0].n,0);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM task_documents WHERE task_id=99999')).rows[0].n,0);
   assert.equal((await pool.query('SELECT count(*)::int AS n FROM attention_snoozes WHERE task_id=99999')).rows[0].n,0);
+});
+
+const azInput=()=>({issue_type:'az',issue_id:'child-30001',issue_key:'ECHD-30002',url:'https://jira.example.test/browse/ECHD-30002',epic_key:'ECHD-30001',epic_url:'https://jira.example.test/browse/ECHD-30001',issue_created_at:'2026-10-20T10:00:00+03:00',status:'Review',assignee:'Маша',checked_at:'2026-10-26T18:00:00+03:00',history_complete:true,status_map:{Queue:'other',Work:'analysis',Review:'review'},history:[{id:'h1',occurred_at:'2026-10-26T11:00:00+03:00',old_status:'Queue',new_status:'Work',actor_name:'Маша'},{id:'h2',occurred_at:'2026-10-26T14:00:00+03:00',old_status:'Work',new_status:'Review',actor_name:'Маша'}]});
+const analysisMail=(id,type,at,extra={})=>({event:{external_id:id,cycle_id:'round-1',type,occurred_at:`2026-10-26T${at}:00+03:00`,source_url:'https://mail.example.test/'+id,...extra}});
+test('AZ binding and import are authenticated, distinct from epic, idempotent and chronological',async()=>{
+  await transaction(pool,c=>writeTask(c,'30001',{title:'АЗ test',status:'ревью'},{id:'1'},{creating:true}));
+  const endpoint=base+'/integrations/jira/tasks/30001/analysis', body=azInput();
+  assert.equal((await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-agent'},body:JSON.stringify(body)})).status,401);
+  await assert.rejects(saveAzSnapshot(pool,'30001',{...body,issue_key:body.epic_key}),e=>e.status===400);
+  assert.equal((await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-jira'},body:JSON.stringify(body)})).status,200);
+  await saveAzSnapshot(pool,'30001',{...body,status_map:{Review:'review',Work:'analysis',Queue:'other'}});
+  assert.equal((await pool.query('SELECT count(*)::int n FROM task_analysis_events WHERE task_id=30001')).rows[0].n,2);
+  await assert.rejects(saveAzSnapshot(pool,'30001',{...body,issue_id:'other-child'}),e=>e.status===409);
+  await assert.rejects(saveAzSnapshot(pool,'30001',{...body,assignee:'Другой'}),e=>e.status===409);
+  await assert.rejects(saveAzSnapshot(pool,'30001',{...body,history:[{...body.history[0],new_status:'Review'}]}),e=>e.status===409);
+  const older=await saveAzSnapshot(pool,'30001',{...body,checked_at:'2026-10-26T10:00:00+03:00',status:'Queue',history:[]});assert.equal(older.stale_snapshot_ignored,true);
+  const snapshot=await (await fetch(base+'/tasks/30001',{headers:{Authorization:'Bearer test-user'}})).json();
+  assert.equal(snapshot.jira.issue_role,'az');assert.equal(snapshot.jira.issue_key,'ECHD-30002');assert.equal(snapshot.status,'ревью');
+  await saveAnalysisMail(pool,'30001',analysisMail('comments-test','comments_received','10:00'));
+  await saveAnalysisMail(pool,'30001',analysisMail('sent-test','document_sent','15:00'));
+  await assert.rejects(saveAnalysisMail(pool,'30001',analysisMail('sent-conflict','document_sent','14:00')),e=>e.status===409);
+  const metrics=await readAnalysis(pool,'30001');assert.equal(metrics.history_complete,true);assert.ok(metrics.cycles[0].waiting_ms>0);
+  assert.equal((await fetch(base+'/integrations/agent/tasks/30001/analysis')).status,401);
+});
+test('final approval and document lock atomically; retries do not relock after manual unlock',async()=>{
+  const approval=analysisMail('final-test','approval_received','17:00',{final:true});
+  await assert.rejects(saveAnalysisMail(pool,'30001',analysisMail('not-final','approval_received','17:00')),e=>e.status===400);
+  const doc={title:'АЗ согласована',source_url:'https://docs.example.test/approved',approved_at:approval.event.occurred_at};
+  // A storage error after inserting the milestone must roll back the approval and lock.
+  const brokenPool={...pool,connect:async()=>({release(){},query:(sql,args)=>String(sql).startsWith('INSERT INTO task_documents')?Promise.reject(new Error('document storage test failure')):pool.query(sql,args)})};
+  await assert.rejects(saveAnalysisMail(brokenPool,'30001',{...approval,document:doc}),/document storage/);
+  assert.equal((await getTask(pool,'30001')).automation_locked,false);
+  assert.equal((await pool.query("SELECT count(*)::int n FROM task_analysis_events WHERE external_id='final-test'")).rows[0].n,0);
+  const r=await saveAnalysisMail(pool,'30001',{...approval,document:doc});assert.equal(r.automation_locked,true);assert.ok(r.document.id);
+  assert.equal((await saveAnalysisMail(pool,'30001',{...approval,document:doc})).duplicate,true);
+  await assert.rejects(applyExternal(pool,'30001',event('locked-action'),{status:'в аналитике'}),e=>e.status===409);
+  await assert.rejects(saveJiraSnapshot(pool,'30001',{issue_id:'old',issue_key:'ECHD-1',url:'https://example.test/1',status:'Work',assignee:null,checked_at:'2026-10-26T18:00:00Z'}),e=>e.status===409);
+  await assert.rejects(saveAzSnapshot(pool,'30001',azInput()),e=>e.status===409);
+  const frozen=await readAnalysis(pool,'30001');assert.equal(frozen.blocked_reason,'approved_manual');assert.equal(frozen.cycles[0].state,'approved');
+  const source=await fs.readFile(new URL('./app.js',import.meta.url),'utf8');let listHandler;
+  vm.runInNewContext(source.slice(source.indexOf('app.get("/tasks",'),source.indexOf('// ================== Task exports')),{app:{get:(_p,_auth,h)=>{listHandler=h;}},requireAuth(){},pool,normalizeStatus,statusFilterValues:s=>[s],toNullableNumber:v=>v==null?null:Number(v),console});
+  let listed;await listHandler({query:{}},{json:value=>{listed=value;},status(){return this;}});
+  assert.equal(listed.find(t=>String(t.id)==='30001').automation_locked,true);
+  await transaction(pool,c=>writeTask(c,'30001',{automation_locked:false,title:'Manual edit works'},{id:'1'}));
+  await saveAnalysisMail(pool,'30001',{...approval,document:doc});assert.equal((await getTask(pool,'30001')).automation_locked,false);
+  await assert.rejects(applyExternal(pool,'30001',event('agent-unlock'),{automation_locked:false}),e=>e.status===400);
+});
+test('all excluded statuses and legacy aliases block automation; manual changes remain allowed',async()=>{
+  for(const status of ['оценка','готова к разработке','разработка','завершена','in_progress','done']) {
+    await pool.query('UPDATE tasks SET status=$2 WHERE id=$1',['30001',status]);
+    await assert.rejects(applyExternal(pool,'30001',event('blocked-'+status),null),e=>e.status===409);
+    await assert.rejects(saveAnalysisMail(pool,'30001',analysisMail('blocked-'+status,'comments_received','10:00')),e=>e.status===409);
+    await transaction(pool,c=>writeTask(c,'30001',{description:'Manual '+status},{id:'1'}));
+  }
+  await pool.query('DELETE FROM tasks WHERE id=30001');
+  assert.equal((await pool.query('SELECT count(*)::int n FROM task_analysis_events WHERE task_id=30001')).rows[0].n,0);
 });

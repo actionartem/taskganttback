@@ -26,6 +26,11 @@ export const normalizeStatus = (value) =>
     done: "завершена",
     review: "ревью",
   })[value] || value;
+export const automationBlock = (task) => task.automation_locked ? "approved_manual" :
+  ["оценка", "готова к разработке", "разработка", "завершена"].includes(normalizeStatus(task.status)) ? "outside_analysis" : null;
+export function requireAutomation(task) {
+  if (automationBlock(task)) fail("automation_disabled: задача согласована или вышла из аналитического процесса", 409);
+}
 export function positiveId(value) {
   if (!["string", "number"].includes(typeof value)) fail("Некорректный ID");
   const n = Number(value);
@@ -98,9 +103,9 @@ export function normalizePatch(body, before = {}, creating = false) {
     )
       out[key] = date(value);
     else if (key === "link_url") out[key] = url(value);
-    else if (key === "deadline_confirmed") {
+    else if (key === "deadline_confirmed" || key === "automation_locked") {
       if (typeof value !== "boolean")
-        fail("deadline_confirmed: ожидается true/false");
+        fail(`${key}: ожидается true/false`);
       out[key] = value;
     } else if (["approved_hours", "spent_hours"].includes(key)) {
       if (value == null || value === "") out[key] = null;
@@ -315,7 +320,7 @@ export function attentionReasons(
   thresholds = {},
   now = new Date(),
 ) {
-  if (normalizeStatus(task.status) === "завершена") return [];
+  if (automationBlock(task)) return [];
   const reasons = [],
     active =
       STAGES[normalizeStatus(task.status)] === "active" && !metrics.paused;

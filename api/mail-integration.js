@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { automationBlock } from "./tracker-domain.js";
 
 const MAIL_EVENT_FIELDS = new Set([
   "message_id",
@@ -272,7 +273,7 @@ export function createMailIntegrationHandler({ pool, mailIntegrationToken }) {
       }
 
       const taskResult = await client.query(
-        `SELECT id, status, due_at, assignee_user_id
+        `SELECT id, status, due_at, assignee_user_id, automation_locked
          FROM tasks
          WHERE id = $1
          FOR UPDATE`,
@@ -283,6 +284,7 @@ export function createMailIntegrationHandler({ pool, mailIntegrationToken }) {
       }
 
       const task = taskResult.rows[0];
+      if (automationBlock(task)) throw new MailIntegrationRequestError(409, "automation_disabled");
       const oldStatus = normalizedStatus(task.status);
       const oldDueAt = dateTimeJsonValue(task.due_at);
       const oldAssigneeUserId = task.assignee_user_id == null ? null : Number(task.assignee_user_id);

@@ -53,7 +53,7 @@ const operation = (summary, body, auth = integration) => ({
   },
 });
 export function extendTrackerSpec(definition) {
-  definition.info.version = "2.0.0";
+  definition.info.version = "2.1.0";
   definition.info.description +=
     "\n\nИнструкция агента: /integrations/guide. Jira передаёт агент; прямого опроса Jira нет.";
   definition.components.securitySchemes.agentToken = {
@@ -70,6 +70,26 @@ export function extendTrackerSpec(definition) {
   };
   Object.assign(definition.components.schemas, {
     ExternalEvent: event,
+    AnalysisMail: {
+      type: "object", required: ["event"], properties: {
+        event: { type: "object", required: ["external_id", "cycle_id", "type", "occurred_at", "source_url"], properties: {
+          external_id: {type:"string",maxLength:500}, cycle_id: {type:"string",maxLength:300},
+          type: {type:"string",enum:["comments_received","document_sent","approval_received"]},
+          occurred_at: {type:"string",format:"date-time"}, source_url:{type:"string",format:"uri"}, actor_name:{type:"string",nullable:true},
+          final:{type:"boolean",description:"Для approval_received обязательно true: подтверждённое финальное согласование АЗ. Атомарно отключает автоматизацию."}
+        }}, document: ref("ApprovedDocumentInput")
+      }
+    },
+    AzSnapshot: {
+      type:"object", required:["issue_type","issue_id","issue_key","url","epic_key","epic_url","issue_created_at","status","assignee","checked_at","status_map","history"],
+      properties: {
+        issue_type:{type:"string",enum:["az"]},issue_id:{type:"string"},issue_key:{type:"string"},url:{type:"string",format:"uri"},
+        epic_key:{type:"string",description:"Родительский эпик, отличается от issue_key"},epic_url:{type:"string",format:"uri"},
+        issue_created_at:{type:"string",format:"date-time"},status:{type:"string"},assignee:{type:"string",nullable:true},checked_at:{type:"string",format:"date-time"},history_complete:{type:"boolean"},
+        status_map:{type:"object",additionalProperties:{type:"string",enum:["analysis","review","approval","other"]}},
+        history:{type:"array",maxItems:1000,items:{type:"object",required:["id","occurred_at","old_status","new_status"],properties:{id:{type:"string"},occurred_at:{type:"string",format:"date-time"},old_status:{type:"string"},new_status:{type:"string"},actor_name:{type:"string",nullable:true}}}}
+      }
+    },
     TrackerChanges: {
       type: "object",
       additionalProperties: false,
@@ -186,6 +206,10 @@ export function extendTrackerSpec(definition) {
         responses: { 200: { description: "Текст инструкции" } },
       },
     },
+    "/integrations/agent/tasks/{id}/analysis": {get:operation("Циклы АЗ, рабочие длительности и состояние автоматизации")},
+    "/tasks/{id}/analysis": {get:operation("Статистика АЗ; 10–19 МСК, 8 часов/день, неполный день пропорционально, выходные РФ исключены",null,security)},
+    "/integrations/agent/tasks/{id}/analysis/events": {post:operation("Факт из почты. Финальное согласование отключает автоматизацию",ref("AnalysisMail"))},
+    "/integrations/jira/tasks/{id}/analysis": {post:operation("Привязка дочерней АЗ и импорт достоверной истории Jira",ref("AzSnapshot"),[{jiraIngestToken:[]}])},
     "/integrations/agent/options": {
       get: {
         ...operation("Активные исполнители, теги и допустимые значения"),
@@ -319,8 +343,12 @@ export function extendTrackerSpec(definition) {
   );
   definition.paths["/tasks/{id}"].patch.requestBody = {
     required: true,
-    content: json(ref("TrackerChanges")),
+    content: json({ ...definition.components.schemas.TrackerChanges, properties: { ...definition.components.schemas.TrackerChanges.properties, automation_locked: {type:"boolean",description:"Только владелец: согласована, дальше вручную"} } }),
   };
+  Object.assign(definition.components.schemas.Task.properties, {
+    automation_locked:{type:"boolean"},automation_locked_at:{type:"string",format:"date-time",nullable:true}
+  });
+  definition.components.schemas.TaskPatch.properties.automation_locked={type:"boolean"};
   definition.paths["/jira"] = {
     get: {
       ...operation("Полученные снимки Jira", null, security),

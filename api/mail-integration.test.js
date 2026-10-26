@@ -103,7 +103,7 @@ class FakeClient {
         : { rowCount: 0, rows: [] };
     }
 
-    if (sql.startsWith("SELECT id, status, due_at, assignee_user_id FROM tasks")) {
+    if (sql.startsWith("SELECT id, status, due_at, assignee_user_id, automation_locked FROM tasks")) {
       const row = this.pool.tasks.get(Number(params[0]));
       return row ? { rowCount: 1, rows: [clone(row)] } : { rowCount: 0, rows: [] };
     }
@@ -237,6 +237,15 @@ function validOutgoing(overrides = {}) {
     ...overrides,
   };
 }
+
+test('legacy mail endpoint rejects locked or downstream tasks without deduplication side effects',async()=>{
+  for(const task of [{status:'в аналитике',automation_locked:true},...['оценка','готова к разработке','разработка','завершена','done','in_progress'].map(status=>({status}))]) {
+    const pool=new FakePool({tasks:[{id:13990,...task}]});
+    const response=await invoke({pool,body:validOutgoing()});
+    assert.equal(response.statusCode,409);assert.equal(response.body.error,'automation_disabled');
+    assert.equal(pool.tasks.get(13990).status,task.status);assert.equal(pool.processedEvents.size,0);
+  }
+});
 
 test("rejects a wrong token and a missing configured token", async () => {
   const pool = new FakePool();

@@ -4,6 +4,7 @@ import {
   positiveId,
   fingerprint,
   normalizeStatus,
+  requireAutomation,
 } from "./tracker-domain.js";
 
 export async function transaction(pool, work) {
@@ -93,7 +94,12 @@ export async function writeTask(
   { creating = false, event: external = null } = {},
 ) {
   const before = creating ? {} : await getTask(client, id, true);
+  if (external && external.source !== "simpletracker") {
+    requireAutomation(before);
+    if (Object.hasOwn(body, "automation_locked")) fail("Агент не может менять ручной флаг; финальное согласование передаётся через analysis/events", 400);
+  }
   const patch = normalizePatch(body, before, creating);
+  if (Object.hasOwn(patch, "automation_locked")) patch.automation_locked_at = patch.automation_locked ? (before.automation_locked_at || new Date().toISOString()) : null;
   if (patch.assignee_user_id) {
     const u = await client.query(
       "SELECT id FROM users WHERE id=$1 AND COALESCE(is_active,true)=true FOR SHARE",
@@ -225,6 +231,7 @@ export async function applyExternal(pool, taskId, event, changes, extra, work) {
     );
     if (duplicate) return { event: duplicate, duplicate: true };
     const before = await getTask(client, taskId, true);
+    if (event.source !== "simpletracker") requireAutomation(before);
     if (event.type === "task.paused" && before.status === "завершена")
       fail("Завершённую задачу нельзя поставить на паузу");
     const result = changes

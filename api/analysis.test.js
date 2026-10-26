@@ -1,0 +1,53 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {workingMilliseconds} from './tracker-working-calendar.js';
+import {analysisMetrics} from './tracker-analysis-metrics.js';
+const hour=3600000, workday=8*hour;
+const at=s=>`2026-10-${s}:00+03:00`;
+const near=(actual,expected)=>assert.ok(Math.abs(actual-expected)<2,`${actual} != ${expected}`);
+const map={Queue:'other',Analysis:'analysis',Review:'review',Approval:'approval'};
+const change=(id,t,old,next)=>({id,source:'jira',type:'jira_status_changed',occurred_at:at(t),actor_name:'Analyst',payload:{old_status:old,new_status:next,old_phase:map[old],new_phase:map[next]}});
+const mail=(id,type,t,cycle='round1')=>({id,source:'mail',type,occurred_at:at(t),cycle_id:cycle,source_url:'https://mail.example.test/message/'+id});
+const az={issue_created_at:at('22T10:00'),checked_at:at('26T19:00'),history_complete:true,status:'Approval',status_map:map};
+const facts=[change('1','26T11:00','Queue','Analysis'),change('2','26T13:00','Analysis','Review'),change('3','26T15:00','Review','Approval'),mail('m1','comments_received','23T18:00'),mail('m2','document_sent','26T14:00'),mail('m3','approval_received','26T18:00')];
+test('eight-hour day within 10–19 Moscow; partial windows prorate, evenings and RF days off excluded',()=>{
+  assert.equal(workingMilliseconds(at('26T00:00'),at('27T00:00')),workday);
+  near(workingMilliseconds(at('23T18:00'),at('26T11:00')),workday*2/9);
+  assert.equal(workingMilliseconds(at('23T19:00'),at('26T10:00')),0);
+  assert.equal(workingMilliseconds('2026-11-04T10:00:00+03:00','2026-11-04T19:00:00+03:00'),0);
+  assert.equal(workingMilliseconds('2026-01-09T10:00:00+03:00','2026-01-09T19:00:00+03:00'),0);
+  assert.equal(workingMilliseconds('2025-11-01T10:00:00+03:00','2025-11-01T19:00:00+03:00'),workday);
+  assert.equal(workingMilliseconds('2028-03-01','2028-03-02'),null);
+  assert.equal(workingMilliseconds(null,at('26T11:00')),null);
+});
+test('mail-to-AZ work, review, customer wait and Jira lag use actual child transitions',()=>{
+  const result=analysisMetrics(az,facts,{now:at('27T10:00')}),c=result.cycles[0];
+  assert.equal(c.state,'approved');
+  near(c.waiting_ms,workday*2/9);
+  near(c.analysis_ms,workday*2/9);
+  near(c.review_ms,workday/9);
+  near(c.approval_ms,workday*4/9);
+  near(c.jira_approval_delay_ms,workday/9);
+  assert.equal(c.started_by,'Analyst');assert.equal(result.schedule.hours_per_day,8);
+});
+test('epic/local history, gaps, unknown calendars and unobserved intervals never fabricate AZ metrics',()=>{
+  const legacy=facts.map(e=>e.source==='jira'?{...e,source:'simpletracker'}:e);
+  assert.equal(analysisMetrics(null,legacy).cycles[0].waiting_ms,null);
+  assert.equal(analysisMetrics({...az,history_complete:false},facts).cycles[0].analysis_ms,null);
+  const broken=facts.map(e=>e.id==='2'?{...e,payload:{...e.payload,old_status:'Another active',old_phase:'analysis'}}:e);
+  assert.equal(analysisMetrics(az,broken).history_complete,false);
+  const old=analysisMetrics({...az,checked_at:at('23T19:00'),status:'Queue'},facts.filter(e=>e.source==='mail'),{now:at('27T10:00')});
+  assert.equal(old.cycles[0].started_at,null);
+});
+test('already working is zero waiting; repeated rounds close at the next comments; stopped tasks stop growing',()=>{
+  const roundFacts=facts.filter(e=>e.type!=='approval_received').concat(mail('m4','comments_received','26T16:00','round2'));
+  const result=analysisMetrics(az,roundFacts,{now:at('27T10:00'),cutoff:at('26T18:00'),stopped:true});
+  assert.equal(result.cycles.length,2);assert.equal(result.cycles[1].state,'returned');
+  near(result.cycles[1].approval_ms,workday*2/9);
+  near(result.cycles[0].waiting_ms,workday*2/9);
+  const working={...az,status:'Analysis'};
+  const c=analysisMetrics(working,[mail('m1','comments_received','23T18:00')],{now:at('27T10:00')}).cycles[0];
+  assert.equal(c.waiting_ms,0);assert.equal(c.started_at,new Date(at('23T18:00')).toISOString());
+  const later=analysisMetrics(az,roundFacts,{now:at('27T19:00'),cutoff:at('26T18:00'),stopped:true});
+  assert.deepEqual(result,later);
+});

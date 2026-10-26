@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import {transaction,writeTask,getTask,applyExternal} from './tracker-store.js';
 import {externalEvent} from './tracker-domain.js';
 import {saveJiraSnapshot} from './tracker-jira.js';
+import {saveAzSnapshot,saveAnalysisMail} from './tracker-analysis.js';
 import {validateDocument,insertDocument,validateApprovedDocument,replaceApprovedDocument} from './tracker-documents.js';
 import {registerTrackerRoutes,handler} from './tracker-routes.js';
 import {setupSwagger} from './swagger.js';
@@ -13,6 +14,7 @@ const db=new PGlite();
 const source=await fs.readFile(new URL('./tracker.test.js',import.meta.url),'utf8');
 const sql=source.match(/await db.exec\(`([\s\S]*?)`\);/)[1];
 await db.exec(sql);await db.exec(await fs.readFile(new URL('../migrations/20261026_tracker_v2.sql',import.meta.url),'utf8'));
+await db.exec(await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8'));
 const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows??r.rows.length}};
 const pool={query,connect:async()=>({query,release(){}})};
 const user={id:'1',name:'Тестовый руководитель',login:'test',is_superadmin:true,token:'local-fixture-only'};
@@ -33,6 +35,12 @@ for (const [id,title,at] of [['synthetic-approved-1','Предыдущий со�
   const approved=validateApprovedDocument({title,approved_at:at,file_name:'approved.txt',file_base64:Buffer.from(title).toString('base64')});
   await applyExternal(pool,'10001',externalEvent({external_id:id,type:'document.approved',summary:title,occurred_at:at},'mail-agent','mail-agent'),null,{approved},(c,r)=>replaceApprovedDocument(c,'10001',r.event.id,approved));
 }
+await saveAzSnapshot(pool,'10001',{issue_type:'az',issue_id:'synthetic-az-142',issue_key:'ECHD-142',url:'https://jira.example.invalid/browse/ECHD-142',epic_key:'ECHD-42',epic_url:'https://jira.example.invalid/browse/ECHD-42',issue_created_at:'2026-10-19T10:00:00+03:00',checked_at:'2026-10-26T18:00:00+03:00',status:'На согласовании в ДИТ',assignee:'Маша',history_complete:true,status_map:{'Открыта':'other','В работе':'analysis','Ревью':'review','На согласовании в ДИТ':'approval'},history:[
+  ['1','20T11:00','Открыта','В работе'],['2','21T17:00','В работе','Ревью'],['3','22T16:00','Ревью','На согласовании в ДИТ'],['4','26T11:00','На согласовании в ДИТ','В работе'],['5','26T13:00','В работе','Ревью'],['6','26T15:00','Ревью','На согласовании в ДИТ']
+].map(([id,t,old_status,new_status])=>({id,occurred_at:`2026-10-${t}:00+03:00`,old_status,new_status,actor_name:'Маша'}))});
+for(const [id,cycle_id,type,t] of [
+  ['c1','first','comments_received','19T14:00'],['s1','first','document_sent','22T15:00'],['c2','second','comments_received','23T18:00'],['s2','second','document_sent','26T14:00'],['a2','second','approval_received','26T17:00']
+]) await saveAnalysisMail(pool,'10001',{event:{external_id:`synthetic-mail-${id}`,cycle_id,type,occurred_at:`2026-10-${t}:00+03:00`,source_url:`https://mail.example.invalid/${id}`,actor_name:type==='document_sent'?'Маша':'ДИТ',...(type==='approval_received'?{final:true}:{})}});
 if (process.env.FIXTURE_LARGE === '1') {
   for(let i=21;i<77;i++) await transaction(pool,c=>writeTask(c,String(10001+i),{title:`Проверка производительности ${i}`,status:statuses[i%7],start_at:`${2025+i%4}-01-05`,due_at:`${2025+i%4}-12-20`,approved_hours:80},user,{creating:true}));
 }

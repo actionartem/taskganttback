@@ -920,6 +920,8 @@ app.get("/tasks", requireAuth, async (req, res) => {
         t.status, t.priority,
         t.assignee_user_id, t.start_at, t.due_at, t.link_url,
         t.approved_hours, t.spent_hours,
+        t.automation_locked, t.automation_locked_at, t.deadline_confirmed,
+        t.next_action_at, t.next_action_text, t.reply_due_at, t.waiting_for,
         t.created_at, t.updated_at,
         u.name AS assignee_name, u.role_text AS assignee_role
       FROM tasks t
@@ -959,6 +961,7 @@ app.get("/tasks", requireAuth, async (req, res) => {
       link_url: row.link_url,
       approved_hours: toNullableNumber(row.approved_hours),
       spent_hours: toNullableNumber(row.spent_hours),
+      automation_locked: row.automation_locked, automation_locked_at: row.automation_locked_at,
       deadline_confirmed: row.deadline_confirmed, next_action_at: row.next_action_at, next_action_text: row.next_action_text, reply_due_at: row.reply_due_at, waiting_for: row.waiting_for,
       created_at: row.created_at,
       updated_at: row.updated_at,
