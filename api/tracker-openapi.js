@@ -53,7 +53,7 @@ const operation = (summary, body, auth = integration) => ({
   },
 });
 export function extendTrackerSpec(definition) {
-  definition.info.version = "2.1.0";
+  definition.info.version = "2.1.1";
   definition.info.description +=
     "\n\nИнструкция агента: /integrations/guide. Jira передаёт агент; прямого опроса Jira нет.";
   definition.components.securitySchemes.agentToken = {
@@ -144,10 +144,15 @@ export function extendTrackerSpec(definition) {
     },
     ApprovedDocumentInput: {
       type: "object",
-      required: ["title", "approved_at"],
+      required: ["title"],
+      oneOf: [
+        { required: ["approved_at"], properties: { approved_at: { type: "string", format: "date-time" }, approval_date_unknown: { enum: [false] } } },
+        { required: ["approval_date_unknown", "approval_evidence"], properties: { approved_at: { type: "string", nullable: true, enum: [null] }, approval_date_unknown: { enum: [true] }, approval_evidence: { type: "string", minLength: 1 } } },
+      ],
       properties: {
         title: { type: "string" },
-        approved_at: { type: "string", format: "date-time", description: "Подтверждённая дата согласования, не в будущем" },
+        approved_at: { type: "string", format: "date-time", nullable: true, description: "Подтверждённая дата согласования, не в будущем; не подставлять дату загрузки" },
+        approval_date_unknown: { type: "boolean", description: "Согласование подтверждено, но дата неизвестна. Нужен approval_evidence; допускается только первоначальная публикация без замены существующего согласованного документа." },
         approval_evidence: { type: "string" },
         version: { type: "string", description: "Необязательный идентификатор версии источника" },
         source_url: { type: "string", format: "uri", nullable: true },
@@ -251,7 +256,7 @@ export function extendTrackerSpec(definition) {
       }),
     },
     "/integrations/agent/tasks/{id}/documents/approved": {
-      post: operation("Заменить последний согласованный документ; событие document.approved", {
+      post: operation("Последний согласованный документ; разрешён также в готовой к разработке карточке без ручной блокировки. Не разрешает прочую автоматизацию", {
         type: "object", required: ["event", "document"],
         properties: { event: ref("ExternalEvent"), document: ref("ApprovedDocumentInput") },
       }),
@@ -346,7 +351,9 @@ export function extendTrackerSpec(definition) {
     content: json({ ...definition.components.schemas.TrackerChanges, properties: { ...definition.components.schemas.TrackerChanges.properties, automation_locked: {type:"boolean",description:"Только владелец: согласована, дальше вручную"} } }),
   };
   Object.assign(definition.components.schemas.Task.properties, {
-    automation_locked:{type:"boolean"},automation_locked_at:{type:"string",format:"date-time",nullable:true}
+    automation_locked:{type:"boolean"},automation_locked_at:{type:"string",format:"date-time",nullable:true},
+    approved_document_write_allowed:{type:"boolean",description:"Отдельное разрешение только на /documents/approved, не на прочие записи"},
+    approved_document_blocked_reason:{type:"string",nullable:true,enum:[null,"approved_manual","outside_analysis"]}
   });
   definition.components.schemas.TaskPatch.properties.automation_locked={type:"boolean"};
   definition.paths["/jira"] = {

@@ -215,7 +215,7 @@ export async function readEvents(client, taskId) {
   );
   return result.rows;
 }
-export async function applyExternal(pool, taskId, event, changes, extra, work) {
+export async function applyExternal(pool, taskId, event, changes, extra, work, guard = requireAutomation) {
   const hash = fingerprint({
     task_id: String(taskId),
     event,
@@ -231,7 +231,7 @@ export async function applyExternal(pool, taskId, event, changes, extra, work) {
     );
     if (duplicate) return { event: duplicate, duplicate: true };
     const before = await getTask(client, taskId, true);
-    if (event.source !== "simpletracker") requireAutomation(before);
+    if (event.source !== "simpletracker") guard(before);
     if (event.type === "task.paused" && before.status === "завершена")
       fail("Завершённую задачу нельзя поставить на паузу");
     const result = changes

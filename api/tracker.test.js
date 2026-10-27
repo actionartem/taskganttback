@@ -227,7 +227,7 @@ test('existing Excel export still filters, writes and reads a workbook using the
 
 test('agent guide and OpenAPI are discoverable; catalogs exclude credentials',async()=>{
   const guide=await fetch(base+'/integrations/guide');assert.equal(guide.status,200);assert.match(await guide.text(),/JIRA_INGEST_TOKEN/);
-  const spec=await (await fetch(base+'/openapi.json')).json();assert.equal(spec.info.version,'2.1.0');assert.ok(spec.paths['/integrations/jira/tasks/{id}/analysis'].post);
+  const spec=await (await fetch(base+'/openapi.json')).json();assert.equal(spec.info.version,'2.1.1');assert.ok(spec.paths['/integrations/jira/tasks/{id}/analysis'].post);
   assert.equal((await fetch(base+'/integrations/agent/options')).status,401);
   const options=await (await fetch(base+'/integrations/agent/options',{headers:{'x-integration-token':'test-agent'}})).json();
   assert.deepEqual(Object.keys(options.users[0]).sort(),['id','name']);assert.ok(options.statuses.includes('разработка'));
@@ -300,4 +300,71 @@ test('all excluded statuses and legacy aliases block automation; manual changes 
   }
   await pool.query('DELETE FROM tasks WHERE id=30001');
   assert.equal((await pool.query('SELECT count(*)::int n FROM task_analysis_events WHERE task_id=30001')).rows[0].n,0);
+});
+
+test('ready approved-document route is a narrow exception; original bytes and local task fields survive replay',async()=>{
+  const id='40001';
+  await transaction(pool,c=>writeTask(c,id,{title:'Ready document',status:'готова к разработке',start_at:'2026-11-02',due_at:'2026-11-05',approved_hours:40,next_action_text:'Manual reminder'},{id:'1'},{creating:true}));
+  const before=await getTask(pool,id), bytes=Buffer.from('Согласованный оригинал с комментариями и правками');
+  const body={event:{external_id:'ready-approved-file',type:'document.approved',summary:'Подтвержденная версия'},document:{title:'АЗ ready',approved_at:'2026-10-20T10:00:00Z',approval_evidence:'Jira explicit approval',file_name:'agreed.txt',file_base64:bytes.toString('base64')}};
+  const post=(payload=body,token='test-agent')=>fetch(`${base}/integrations/agent/tasks/${id}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':token},body:JSON.stringify(payload)});
+  assert.equal((await post(body,'test-jira')).status,401);
+  assert.equal((await post({...body,changes:{status:'в аналитике'}})).status,400);
+  const first=await post();assert.equal(first.status,201);const saved=await first.json();
+  const retry=await post();assert.equal(retry.status,200);assert.equal((await retry.json()).document.id,saved.document.id);
+  assert.equal((await post({...body,event:{...body.event,external_id:'unknown-must-not-replace-known'},document:{title:'Cannot order',approval_date_unknown:true,approval_evidence:'Confirmed but no date',source_url:'https://example.test/unknown'}})).status,409);
+  assert.deepEqual(await getTask(pool,id),before);
+  const view=await(await fetch(`${base}/integrations/agent/tasks/${id}`,{headers:{'x-integration-token':'test-agent'}})).json();
+  assert.equal(view.automation_blocked_reason,'outside_analysis');assert.equal(view.approved_document_write_allowed,true);assert.equal(view.approved_document_blocked_reason,null);
+  const list=await(await fetch(base+'/integrations/agent/tasks',{headers:{'x-integration-token':'test-agent'}})).json();
+  assert.equal(list.find(x=>String(x.id)===id).approved_document_write_allowed,true);
+  const download=await fetch(`${base}/integrations/agent/tasks/${id}/documents/${saved.document.id}/download`,{headers:{'x-integration-token':'test-agent'}});
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()),bytes);
+  // An event named document.approved on a generic route does not grant the capability.
+  for(const [route,payload] of [
+    ['events',{event:{...body.event,external_id:'ready-generic-approval'}}],
+    ['actions',{event:{...body.event,external_id:'ready-action'},changes:{title:'Forbidden'}}],
+    ['documents',{event:{...body.event,type:'document.received',external_id:'ready-draft'},document:{kind:'az',title:'draft',version:'1',source_url:'https://example.test/draft'}}],
+    ['analysis/events',analysisMail('ready-comments','comments_received','10:00')],
+  ])assert.equal((await fetch(`${base}/integrations/agent/tasks/${id}/${route}`,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-agent'},body:JSON.stringify(payload)})).status,409);
+  await assert.rejects(saveAzSnapshot(pool,id,azInput()),e=>e.status===409);
+  await assert.rejects(saveJiraSnapshot(pool,id,{issue_id:'other',issue_key:'ECHD-1',url:'https://example.test/1',status:'Work',assignee:null,checked_at:'2026-10-26T18:00:00Z'}),e=>e.status===409);
+  assert.equal((await readEvents(pool,id)).length,2); // initial owner edit + one document fact
+  assert.deepEqual(await getTask(pool,id),before);
+});
+
+test('approved-document exception never unlocks manual approval or development/evaluation/completion',async()=>{
+  const id='40001';
+  const post=n=>fetch(`${base}/integrations/agent/tasks/${id}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-agent'},body:JSON.stringify({event:{external_id:'blocked-document-'+n,type:'document.approved',summary:'Forbidden'},document:{title:'Do not save',approved_at:'2026-10-26T10:00:00Z',source_url:'https://example.test/approved'}})});
+  for(const status of ['оценка','разработка','завершена','in_progress','done']) {
+    await pool.query('UPDATE tasks SET status=$2 WHERE id=$1',[id,status]);assert.equal((await post(status)).status,409);
+    const view=await(await fetch(`${base}/integrations/agent/tasks/${id}`,{headers:{'x-integration-token':'test-agent'}})).json();assert.equal(view.approved_document_write_allowed,false);
+  }
+  for(const status of ['готова к разработке','в аналитике','ревью','на согласовании']) {
+    await pool.query('UPDATE tasks SET status=$2,automation_locked=true WHERE id=$1',[id,status]);assert.equal((await post('locked-'+status)).status,409);
+    const view=await(await fetch(`${base}/integrations/agent/tasks/${id}`,{headers:{'x-integration-token':'test-agent'}})).json();assert.equal(view.approved_document_blocked_reason,'approved_manual');
+  }
+  assert.equal((await pool.query('SELECT count(*)::int n FROM task_documents WHERE task_id=$1',[id])).rows[0].n,1);
+});
+
+test('confirmed approval with unknown date is visible without invented time, idempotent and cannot reorder versions',async()=>{
+  const id='40002';await transaction(pool,c=>writeTask(c,id,{title:'Unknown approval date',status:'готова к разработке'},{id:'1'},{creating:true}));
+  const body={event:{external_id:'unknown-approved',type:'document.approved',summary:'Согласован в Confluence, дата не указана'},document:{title:'АЗ without approval date',approval_date_unknown:true,approval_evidence:'Confluence approved row, https://example.test/page',source_url:'https://example.test/agreed'}};
+  const post=payload=>fetch(`${base}/integrations/agent/tasks/${id}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json','x-integration-token':'test-agent'},body:JSON.stringify(payload)});
+  assert.equal((await post({...body,document:{...body.document,approval_evidence:''}})).status,400);
+  assert.equal((await post({...body,document:{...body.document,approved_at:'2026-10-20T10:00:00Z'}})).status,400);
+  const response=await post(body);assert.equal(response.status,201);const first=await response.json();assert.equal(first.document.approved_at,null);
+  const retry=await post(body);assert.equal(retry.status,200);assert.equal((await retry.json()).document.id,first.document.id);
+  const read=await(await fetch(`${base}/integrations/agent/tasks/${id}/documents?latest=approved`,{headers:{'x-integration-token':'test-agent'}})).json();assert.equal(read.length,1);assert.equal(read[0].approved_at,null);
+  const all=await(await fetch(base+'/documents?latest=approved',{headers:{Authorization:'Bearer test-user'}})).json();assert.equal(all.find(x=>String(x.task_id)===id).id,first.document.id);
+  assert.equal((await post({...body,event:{...body.event,external_id:'unknown-replacement'}})).status,409);
+  assert.equal((await post({...body,event:{...body.event,external_id:'dated-after-unknown'},document:{...body.document,approval_date_unknown:false,approved_at:'2026-10-25T10:00:00Z'}})).status,409);
+  assert.equal((await pool.query('SELECT count(*)::int n FROM task_documents WHERE task_id=$1',[id])).rows[0].n,1);
+});
+
+test('DOCM original is supported without renaming; misleading content remains rejected',()=>{
+  const bytes=Buffer.concat([Buffer.from('504b0304','hex'),Buffer.from('synthetic DOCM package; original bytes')]);
+  const doc=validateDocument({kind:'az',title:'original',version:'1',file_name:'original.docm',file_base64:bytes.toString('base64')});
+  assert.equal(doc.file_name,'original.docm');assert.equal(doc.mime_type,'application/vnd.ms-word.document.macroEnabled.12');assert.deepEqual(doc.file_bytes,bytes);
+  assert.throws(()=>validateDocument({kind:'az',title:'bad',version:'1',file_name:'fake.docm',file_base64:Buffer.from('not a package').toString('base64')}),e=>e.status===400);
 });

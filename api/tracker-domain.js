@@ -31,6 +31,12 @@ export const automationBlock = (task) => task.automation_locked ? "approved_manu
 export function requireAutomation(task) {
   if (automationBlock(task)) fail("automation_disabled: задача согласована или вышла из аналитического процесса", 409);
 }
+// Route-specific exception: publish an approved original, not resume automation.
+export const approvedDocumentBlock = (task) => task.automation_locked ? "approved_manual" :
+  normalizeStatus(task.status) === "готова к разработке" ? null : automationBlock(task);
+export function requireApprovedDocumentWrite(task) {
+  if (approvedDocumentBlock(task)) fail("automation_disabled: запись согласованного документа заблокирована", 409);
+}
 export function positiveId(value) {
   if (!["string", "number"].includes(typeof value)) fail("Некорректный ID");
   const n = Number(value);

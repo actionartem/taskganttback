@@ -7,6 +7,7 @@ const types = {
   pdf: "application/pdf",
   doc: "application/msword",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  docm: "application/vnd.ms-word.document.macroEnabled.12",
   xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   xls: "application/vnd.ms-excel",
   txt: "text/plain",
@@ -44,7 +45,7 @@ export function validateDocument(body) {
     const prefix = bytes.subarray(0, 8).toString("hex");
     if (
       (ext === "pdf" && bytes.subarray(0, 5).toString() !== "%PDF-") ||
-      (["docx", "xlsx"].includes(ext) && !prefix.startsWith("504b0304")) ||
+      (["docx", "docm", "xlsx"].includes(ext) && !prefix.startsWith("504b0304")) ||
       (["doc", "xls"].includes(ext) && prefix !== "d0cf11e0a1b11ae1") ||
       (ext === "png" && prefix !== "89504e470d0a1a0a") ||
       (["jpg", "jpeg"].includes(ext) && !prefix.startsWith("ffd8ff")) ||
@@ -72,14 +73,23 @@ export async function insertDocument(client, taskId, eventId, doc) {
 }
 
 export function validateApprovedDocument(body) {
+  if (body?.approval_date_unknown !== undefined && typeof body.approval_date_unknown !== "boolean") fail("approval_date_unknown должен быть boolean");
   const approvedAt = date(body?.approved_at);
-  if (!approvedAt || new Date(approvedAt) > new Date()) fail("Укажите дату согласования, не позднее сегодняшней");
+  const unknown = body?.approval_date_unknown === true;
+  const evidence = text(body?.approval_evidence, 4000);
+  if (unknown && approvedAt) fail("Не передавайте дату при approval_date_unknown:true");
+  if (unknown && !evidence) fail("Неизвестной дате требуется подтверждение согласования");
+  if ((!unknown && !approvedAt) || (approvedAt && new Date(approvedAt) > new Date())) fail("Укажите дату согласования, не позднее сегодняшней, или approval_date_unknown:true с подтверждением");
   return { ...validateDocument({ ...body, kind: "other", version: body.version || "approved" }),
-    approved_at: approvedAt, approval_evidence: text(body.approval_evidence, 4000) || "Добавлен как согласованный документ" };
+    approved_at: approvedAt, approval_evidence: evidence || "Добавлен как согласованный документ" };
 }
 
 export async function replaceApprovedDocument(client, taskId, eventId, doc) {
   // applyExternal holds the task row lock: publication and history are atomic.
+  const unknown = (await client.query("SELECT id FROM task_documents WHERE task_id=$1 AND approved_at IS NULL AND approval_evidence IS NOT NULL AND is_current=true", [taskId])).rows;
+  const published = (await client.query("SELECT id FROM task_documents WHERE task_id=$1 AND (approved_at IS NOT NULL OR (is_current=true AND approval_evidence IS NOT NULL))", [taskId])).rows;
+  if ((doc.approved_at == null && published.length) || unknown.length)
+    fail("Нельзя автоматически упорядочить версии с неизвестной датой согласования; нужна ручная сверка", 409);
   const latest = (await client.query("SELECT max(approved_at) AS approved_at FROM task_documents WHERE task_id=$1", [taskId])).rows[0]?.approved_at;
   if (latest && new Date(latest) > new Date(doc.approved_at)) fail("У задачи уже есть документ с более поздней датой согласования", 409);
   await client.query("UPDATE task_documents SET is_current=false WHERE task_id=$1 AND is_current=true", [taskId]);
