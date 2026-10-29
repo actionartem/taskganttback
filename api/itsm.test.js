@@ -57,7 +57,9 @@ test('reading details remembers creation time without editing local fields, and 
 
 test('creation-date backfill covers archived records without changing manual closure or polling known dates again', async () => {
   const incident=await create();
-  const closed=await (await call(`/incidents/${incident.id}/close`,'POST',{status:'burned',version:1})).json();
+  await call(`/incidents/${incident.id}/close`,'POST',{status:'burned',version:1});
+  await pool.query('UPDATE incidents SET archive_initial=true WHERE id=$1',[incident.id]);
+  const closed=JSON.parse(JSON.stringify(await row(incident.id)));
   const load=createIncidentCreationLoader({pool,itsm});
   await load(); await load();
   const filled=JSON.parse(JSON.stringify(await row(incident.id)));
@@ -68,6 +70,7 @@ test('creation-date backfill covers archived records without changing manual clo
 
 test('creation-date backfill bounds requests and retries failures without starving other records', async () => {
   for(const number of ['100','101','102']) await create({number});
+  await pool.query("UPDATE incidents SET archive_initial=true,status='completed',closed_at=$1,closure_source='manual'",[NOW.toISOString()]);
   let time=+NOW, active=0, maxActive=0;
   const calls=[];
   const client={async record(number) {
@@ -82,14 +85,32 @@ test('creation-date backfill bounds requests and retries failures without starvi
   time+=300001; await load(); assert.equal(calls.length,4); assert.equal(calls.at(-1),'102');
 });
 
-test('creation-date response cannot attach to a renumbered incident or overwrite a concurrent manual closure', async () => {
+test('creation-date response cannot attach to a renumbered archived incident', async () => {
   const incident=await create();
-  recordHook=async()=>{recordHook=null; assert.equal((await call(`/incidents/${incident.id}`,'PATCH',{...input,number:'27787458',version:1})).status,200);};
+  await call(`/incidents/${incident.id}/close`,'POST',{status:'completed',version:1});
+  await pool.query('UPDATE incidents SET archive_initial=true WHERE id=$1',[incident.id]);
+  recordHook=async()=>{recordHook=null; assert.equal((await call(`/incidents/${incident.id}`,'PATCH',{...input,number:'27787458',version:2})).status,200);};
   await createIncidentCreationLoader({pool,itsm})(); assert.equal((await row(incident.id)).itsm_created_at,null);
   source={...remote(),id:27787458};
-  recordHook=async()=>{recordHook=null; assert.equal((await call(`/incidents/${incident.id}/close`,'POST',{status:'completed',version:2})).status,200);};
   await createIncidentCreationLoader({pool,itsm})();
   const saved=await row(incident.id); assert.equal(saved.status,'completed'); assert.equal(saved.closure_source,'manual'); assert.equal(saved.version,3); assert.equal(saved.next_check_at,null); assert.ok(saved.itsm_created_at);
+});
+
+test('initial archive is captured once; later manual and automatic closures keep their append order', async () => {
+  const original=await create(), later=await create({number:'27787458'});
+  await call(`/incidents/${original.id}/close`,'POST',{status:'completed',version:1});
+  await pool.query('ALTER TABLE incidents DROP COLUMN archive_initial');
+  const migration=await fs.readFile(new URL('../migrations/20261029_incidents_created_at.sql',import.meta.url),'utf8');
+  await db.exec(migration);
+  assert.equal((await row(original.id)).archive_initial,true); assert.equal((await row(later.id)).archive_initial,false);
+  await call(`/incidents/${later.id}/close`,'POST',{status:'completed',version:1});
+  await db.exec(migration); assert.equal((await row(later.id)).archive_initial,false);
+  await pool.query('UPDATE incidents SET itsm_created_at=$1 WHERE id=$2',[NOW.toISOString(),original.id]);
+  await createIncidentCreationLoader({pool,itsm})(); assert.equal(recordCalls,0);
+  const automatic=await create({number:'27787459'}); source={...remote(),id:27787459,status:'completed',waiting_until:null,completed_at:'2026-10-29T14:00:00Z'};
+  await pool.query('UPDATE incidents SET next_check_at=$1 WHERE id=$2',[NOW.toISOString(),automatic.id]);
+  await runIncidentMonitor({pool,itsm,now:NOW});
+  assert.equal((await row(automatic.id)).status,'completed'); assert.equal((await row(automatic.id)).archive_initial,false);
 });
 
 test('ITSM reads all pages, keeps partial errors separate, uses only fixed-host authenticated GETs', async () => {

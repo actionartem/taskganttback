@@ -24,7 +24,7 @@ export function createIncidentCreationLoader({ pool, itsm, now = Date.now, batch
     if (running) return;
     running = true;
     try {
-      const { rows } = await pool.query('SELECT id,number FROM incidents WHERE itsm_created_at IS NULL ORDER BY id DESC');
+      const { rows } = await pool.query('SELECT id,number FROM incidents WHERE archive_initial AND itsm_created_at IS NULL ORDER BY id DESC');
       const key = row => `${row.id}:${row.number}`;
       const pending = new Set(rows.map(key));
       for (const id of retryAfter.keys()) if (!pending.has(id)) retryAfter.delete(id);
