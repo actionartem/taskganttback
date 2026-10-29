@@ -38,7 +38,7 @@ export function createIncidentCreationLoader({ pool, itsm, now = Date.now, batch
             const created = await rememberIncidentCreatedAt(pool, incident, record);
             if (created) retryAfter.delete(id);
             else retryAfter.set(id, now() + 3600000);
-          } catch { retryAfter.set(id, now() + 300000); }
+          } catch (error) { retryAfter.set(id, error?.status === 404 ? Infinity : now() + 300000); }
         }
       }));
     } finally { running = false; }

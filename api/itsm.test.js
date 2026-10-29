@@ -96,6 +96,18 @@ test('creation-date response cannot attach to a renumbered archived incident', a
   const saved=await row(incident.id); assert.equal(saved.status,'completed'); assert.equal(saved.closure_source,'manual'); assert.equal(saved.version,3); assert.equal(saved.next_check_at,null); assert.ok(saved.itsm_created_at);
 });
 
+test('initial archive entries not found in ITSM are not polled repeatedly', async () => {
+  const incident=await create();
+  await call(`/incidents/${incident.id}/close`,'POST',{status:'completed',version:1});
+  await pool.query('UPDATE incidents SET archive_initial=true WHERE id=$1',[incident.id]);
+  let time=+NOW, calls=0;
+  const client={async record() { calls++; throw Object.assign(new Error('not found'),{status:404}); }};
+  const load=createIncidentCreationLoader({pool,itsm:client,now:()=>time});
+  await load(); time+=86400000; await load();
+  assert.equal(calls,1); const saved=await row(incident.id);
+  assert.equal(saved.itsm_created_at,null); assert.equal(saved.status,'completed'); assert.equal(saved.version,2);
+});
+
 test('initial archive is captured once; later manual and automatic closures keep their append order', async () => {
   const original=await create(), later=await create({number:'27787458'});
   await call(`/incidents/${original.id}/close`,'POST',{status:'completed',version:1});
