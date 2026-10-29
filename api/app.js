@@ -3,8 +3,10 @@
 import express from "express";
 import { registerTrackerRoutes } from './tracker-routes.js';
 import { registerIncidentRoutes } from './tracker-incidents.js';
+import { createUserAuthenticator, permissionGuard } from './tracker-permissions.js';
+import { registerUserWriteRoutes } from './tracker-users.js';
 import { transaction, writeTask, setTaskTag } from './tracker-store.js';
-import { sessionCodec,sessionMatchesUser } from './tracker-session.js';
+import { sessionCodec } from './tracker-session.js';
 import { RequestError } from './tracker-domain.js';
 import pkg from "pg";
 import { setupSwagger } from "./swagger.js";
@@ -269,34 +271,7 @@ function rateLimitAuth(req, res, next) {
   return next();
 }
 
-async function authenticateRequest(req, res, next) {
-  try {
-    const internalToken = req.get("x-internal-token");
-    if (INTERNAL_API_TOKEN && safeEqual(internalToken, INTERNAL_API_TOKEN)) {
-      req.isInternal = true;
-      return next();
-    }
-
-    const payload = verifySessionToken(getRequestSessionToken(req));
-    if (!payload) return res.status(401).json({ error: "unauthorized" });
-
-    const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation
-       FROM users
-       WHERE id=$1 AND COALESCE(is_active, true) = true`,
-      [payload.sub]
-    );
-    if (r.rowCount === 0) return res.status(401).json({ error: "unauthorized" });
-
-    if (!sessionMatchesUser(payload,r.rows[0])) return res.status(401).json({error:'session revoked'});
-    req.user = r.rows[0];
-    req.isInternal = false;
-    return next();
-  } catch (e) {
-    console.error("auth middleware error:", e);
-    return res.status(500).json({ error: "auth error" });
-  }
-}
+const authenticateRequest = createUserAuthenticator({ pool, verifySessionToken, getRequestSessionToken, internalToken: INTERNAL_API_TOKEN, safeEqual });
 
 function requireAuth(req, res, next) {
   return authenticateRequest(req, res, next);
@@ -316,30 +291,8 @@ function requireSuperadmin(req, res, next) {
   });
 }
 
-function getRoleText(user) {
-  return String(user?.role_text || "").toLowerCase();
-}
-
-function isReadOnlyUser(user) {
-  if (!user || user.is_superadmin) return false;
-  const role = getRoleText(user);
-  return [
-    "viewer",
-    "read-only",
-    "readonly",
-    "только чтение",
-    "просмотр",
-    "наблюдатель",
-  ].some((marker) => role.includes(marker));
-}
-
-function requireEditor(req, res, next) {
-  return authenticateRequest(req, res, () => {
-    if (!req.user) return res.status(401).json({ error: "unauthorized" });
-    if (isReadOnlyUser(req.user)) return res.status(403).json({ error: "read only user" });
-    return next();
-  });
-}
+const requireEditor = permissionGuard(authenticateRequest, 'editTasks');
+const requireIncidentEditor = permissionGuard(authenticateRequest, 'editIncidents');
 
 function requireInternal(req, res, next) {
   const internalToken = req.get("x-internal-token");
@@ -584,7 +537,7 @@ app.post("/auth/login", rateLimitAuth, async (req, res) => {
   if (!login) return res.status(400).json({ error: "login is required" });
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation FROM users WHERE login = $1`,
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, access_role, session_generation FROM users WHERE login = $1`,
       [login]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
@@ -618,7 +571,7 @@ app.post("/auth/register-password", rateLimitAuth, async (req, res) => {
         (login, password_hash, name, role_text, telegram_id, is_superadmin, is_active, first_name, last_name, created_at)
       VALUES
         ($1, $2, $3, COALESCE($4,''), NULL, $5, true, '', '', NOW())
-      RETURNING id, login, name, role_text, telegram_id, is_superadmin, session_generation
+      RETURNING id, login, name, role_text, telegram_id, is_superadmin, access_role, session_generation
       `,
       [login, passHash, name, role_text || "", isFirstUser]
     );
@@ -634,7 +587,7 @@ app.post("/auth/login-password", rateLimitAuth, async (req, res) => {
   if (!login || !password) return res.status(400).json({ error: "login and password are required" });
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin, session_generation, password_hash FROM users WHERE login = $1`,
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, access_role, session_generation, password_hash FROM users WHERE login = $1 AND COALESCE(is_active,true)=true`,
       [login]
     );
     if (r.rowCount === 0) return res.status(401).json({ error: "user not found" });
@@ -733,7 +686,7 @@ app.post("/auth/telegram/code-from-bot", requireInternal, async (req, res) => {
       UPDATE users
       SET telegram_id = $1, name = COALESCE($2,name)
       WHERE id = $3
-      RETURNING id, login, name, role_text, telegram_id, is_superadmin
+      RETURNING id, login, name, role_text, telegram_id, is_superadmin, access_role
       `,
       [telegram_id, name ? toStr(name) : null, userId]
     );
@@ -752,7 +705,7 @@ app.get("/me", requireUser, async (req, res) => {
   if (!id) return res.status(400).json({ error: "user_id is required" });
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin FROM users WHERE id=$1`,
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, access_role FROM users WHERE id=$1`,
       [id]
     );
     if (r.rowCount === 0) return res.status(404).json({ error: "not found" });
@@ -766,7 +719,7 @@ app.get("/me", requireUser, async (req, res) => {
 app.get("/users", requireUser, async (req, res) => {
   try {
     const r = await pool.query(
-      `SELECT id, login, name, role_text, telegram_id, is_superadmin FROM users ORDER BY id ASC`
+      `SELECT id, login, name, role_text, telegram_id, is_superadmin, access_role FROM users ORDER BY id ASC`
     );
     res.json(r.rows);
   } catch (e) {
@@ -775,52 +728,7 @@ app.get("/users", requireUser, async (req, res) => {
   }
 });
 
-app.post("/users", requireSuperadmin, async (req, res) => {
-  const { name, role_text } = req.body;
-  if (!name) return res.status(400).json({ error: "name is required" });
-
-  const login = `user_${Date.now()}`;
-  try {
-    const r = await pool.query(
-      `
-      INSERT INTO users (login, password_hash, name, role_text, telegram_id, is_superadmin, is_active, first_name, last_name, created_at)
-      VALUES ($1, NULL, $2, COALESCE($3,''), NULL, false, true, '', '', NOW())
-      RETURNING id
-      `,
-      [login, name, role_text || ""]
-    );
-    res.status(201).json({ id: r.rows[0].id });
-  } catch (e) {
-    console.error("POST /users error:", e);
-    res.status(500).json({ error: "db error" });
-  }
-});
-
-app.patch("/users/:id", requireUser, async (req, res) => {
-  const userId = Number(req.params.id);
-  const { name, role_text, telegram_id } = req.body;
-  if (!req.user.is_superadmin && req.user.id !== userId) {
-    return res.status(403).json({ error: "forbidden" });
-  }
-  try {
-    const r = await pool.query(
-      `
-      UPDATE users
-      SET name = COALESCE($1,name),
-          role_text = COALESCE($2,role_text),
-          telegram_id = COALESCE($3,telegram_id)
-      WHERE id = $4
-      RETURNING id, login, name, role_text, telegram_id, is_superadmin
-      `,
-      [name || null, role_text || null, telegram_id || null, userId]
-    );
-    if (r.rowCount === 0) return res.status(404).json({ error: "user not found" });
-    res.json(r.rows[0]);
-  } catch (e) {
-    console.error("PATCH /users/:id error:", e);
-    res.status(500).json({ error: "db error" });
-  }
-});
+registerUserWriteRoutes(app,{pool,requireUser,requireSuperadmin,hashPassword});
 
 app.delete("/users/:id", requireSuperadmin, async (req, res) => {
   const userId = Number(req.params.id);
@@ -1104,6 +1012,6 @@ app.delete("/tasks/:id/tags/:tagId", requireEditor, async (req, res) => {
 
 // ==================
 registerTrackerRoutes(app,{pool,requireUser,requireEditor});
-registerIncidentRoutes(app,{pool,requireUser,requireEditor});
+registerIncidentRoutes(app,{pool,requireUser,requireIncidentEditor});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API listening on port", PORT));

@@ -10,6 +10,7 @@ import {saveAzSnapshot,saveAnalysisMail} from './tracker-analysis.js';
 import {validateDocument,insertDocument,validateApprovedDocument,replaceApprovedDocument} from './tracker-documents.js';
 import {registerTrackerRoutes,handler} from './tracker-routes.js';
 import {registerIncidentRoutes} from './tracker-incidents.js';
+import {permissionGuard} from './tracker-permissions.js';
 import {setupSwagger} from './swagger.js';
 const db=new PGlite();
 const source=await fs.readFile(new URL('./tracker.test.js',import.meta.url),'utf8');
@@ -17,9 +18,12 @@ const sql=source.match(/await db.exec\(`([\s\S]*?)`\);/)[1];
 await db.exec(sql);await db.exec(await fs.readFile(new URL('../migrations/20261026_tracker_v2.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents.sql',import.meta.url),'utf8'));
+await db.exec(await fs.readFile(new URL('../migrations/20261029_user_access_roles.sql',import.meta.url),'utf8'));
 const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows??r.rows.length}};
 const pool={query,connect:async()=>({query,release(){}})};
-const user={id:'1',name:'Тестовый руководитель',login:'test',is_superadmin:true,token:'local-fixture-only'};
+const user={id:'1',name:'Тестовый руководитель',login:'test',is_superadmin:true,access_role:'editor',token:'local-fixture-only'};
+const support={id:'2',name:'Тестовая поддержка',login:'support',is_superadmin:false,access_role:'incident_editor',token:'local-incident-editor-only'};
+await pool.query("INSERT INTO users(id,name,role_text,access_role) VALUES(2,'Тестовая поддержка','Поддержка','incident_editor')");
 for (const [number,priority,expires,deferred] of [
   ['INC-1042','high','2026-10-29T18:00:00+03:00',null],
   ['INC-1043','medium','2026-10-29T19:30:00+03:00','2026-11-02T12:00:00+03:00'],
@@ -54,19 +58,21 @@ if (process.env.FIXTURE_LARGE === '1') {
   for(let i=21;i<77;i++) await transaction(pool,c=>writeTask(c,String(10001+i),{title:`Проверка производительности ${i}`,status:statuses[i%7],start_at:`${2025+i%4}-01-05`,due_at:`${2025+i%4}-12-20`,approved_hours:80},user,{creating:true}));
 }
 const app=express();app.use(cors({origin:'http://localhost:3015',credentials:true}));app.use(express.json({limit:'15mb'}));
-const auth=(req,res,next)=>{if(req.get('authorization')!=='Bearer local-fixture-only')return res.status(401).json({error:'test session required'});req.user=user;next()};
-app.post('/auth/login-password',(req,res)=>res.json(user));app.post('/auth/logout',auth,(req,res)=>res.json({ok:true}));
-app.get('/users',auth,(req,res)=>res.json([user]));app.get('/tags',auth,handler(async(req,res)=>res.json((await pool.query('SELECT * FROM tags')).rows)));
+const auth=(req,res,next)=>{req.user=req.get('authorization')===`Bearer ${support.token}`?support:req.get('authorization')===`Bearer ${user.token}`?user:null;if(!req.user)return res.status(401).json({error:'test session required'});next()};
+const editor=permissionGuard(auth,'editTasks'),incidentEditor=permissionGuard(auth,'editIncidents');
+app.post('/auth/login-password',(req,res)=>res.json(req.body.login==='support'?support:user));app.post('/auth/logout',auth,(req,res)=>res.json({ok:true}));
+app.get('/me',auth,(req,res)=>res.json(req.user));
+app.get('/users',auth,(req,res)=>res.json([user,support]));app.get('/tags',auth,handler(async(req,res)=>res.json((await pool.query('SELECT * FROM tags')).rows)));
 app.get('/tasks',auth,handler(async(req,res)=>{const result=[];for(const t of (await pool.query('SELECT id FROM tasks ORDER BY id')).rows)result.push(await getTask(pool,t.id));res.json(result)}));
-app.post('/tasks',auth,handler(async(req,res)=>res.status(201).json((await transaction(pool,c=>writeTask(c,req.body.id,req.body,user,{creating:true}))).task)));
-app.patch('/tasks/:id',auth,handler(async(req,res)=>{
+app.post('/tasks',editor,handler(async(req,res)=>res.status(201).json((await transaction(pool,c=>writeTask(c,req.body.id,req.body,req.user,{creating:true}))).task)));
+app.patch('/tasks/:id',editor,handler(async(req,res)=>{
   if(req.body.title==='TEST_SAVE_ERROR')return res.status(500).json({error:'Тестовая ошибка сохранения'});
   if(req.body.title==='TEST_EXPIRED_SESSION')return res.status(401).json({error:'Тест: сессия истекла'});
   const task=(await transaction(pool,c=>writeTask(c,req.params.id,req.body,user))).task;
   if(req.body.title==='TEST_UNCERTAIN_SAVED')return res.status(500).json({error:'Тест: ответ потерян после commit'});
   res.json(task);
 }));
-registerTrackerRoutes(app,{pool,requireUser:auth,requireEditor:auth,env:{AGENT_API_TOKEN:'local-agent-only',JIRA_INGEST_TOKEN:'local-jira-only'},startJobs:false});
-registerIncidentRoutes(app,{pool,requireUser:auth,requireEditor:auth});
+registerTrackerRoutes(app,{pool,requireUser:auth,requireEditor:editor,env:{AGENT_API_TOKEN:'local-agent-only',JIRA_INGEST_TOKEN:'local-jira-only'},startJobs:false});
+registerIncidentRoutes(app,{pool,requireUser:auth,requireIncidentEditor:incidentEditor});
 setupSwagger(app);
 app.listen(3891,'127.0.0.1',()=>console.log('Synthetic fixture API on 127.0.0.1:3891'));

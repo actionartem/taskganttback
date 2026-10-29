@@ -36,20 +36,20 @@ export function validateIncident(body, { updating = false } = {}) {
   return { number: body.number.trim(), jira_url: jira.href, priority: body.priority, expires_at: expires, is_deferred: body.is_deferred, deferred_until: deferred };
 }
 
-export function registerIncidentRoutes(app, { pool, requireUser, requireEditor }) {
+export function registerIncidentRoutes(app, { pool, requireUser, requireIncidentEditor }) {
   app.get('/incidents', requireUser, handler(async (_req, res) => {
     res.set('Cache-Control', 'private, no-store');
     res.json({ items: (await pool.query(`SELECT * FROM incidents ORDER BY
       CASE WHEN is_deferred THEN deferred_until ELSE expires_at END, id`)).rows });
   }));
-  app.post('/incidents', requireEditor, handler(async (req, res) => {
+  app.post('/incidents', requireIncidentEditor, handler(async (req, res) => {
     const input = validateIncident(req.body);
     const result = await pool.query(`INSERT INTO incidents
       (number,jira_url,priority,expires_at,is_deferred,deferred_until,created_by,updated_by)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING *`, [...Object.values(input), req.user.id]);
     res.status(201).json(result.rows[0]);
   }));
-  app.patch('/incidents/:id', requireEditor, handler(async (req, res) => {
+  app.patch('/incidents/:id', requireIncidentEditor, handler(async (req, res) => {
     const id = positiveId(req.params.id);
     const input = validateIncident(req.body, { updating: true });
     const result = await pool.query(`UPDATE incidents SET
@@ -62,7 +62,7 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireEditor }
     }
     res.json(result.rows[0]);
   }));
-  app.delete('/incidents/:id', requireEditor, handler(async (req, res) => {
+  app.delete('/incidents/:id', requireIncidentEditor, handler(async (req, res) => {
     const id = positiveId(req.params.id);
     if (!Number.isInteger(req.body?.version) || req.body.version < 1) fail('Укажите версию инцидента');
     const result = await pool.query('DELETE FROM incidents WHERE id=$1 AND version=$2 RETURNING id', [id, req.body.version]);

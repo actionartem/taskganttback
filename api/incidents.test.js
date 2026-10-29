@@ -20,7 +20,7 @@ before(async () => {
     req.user = { id: '1' }; next();
   };
   const requireEditor = (req, res, next) => requireUser(req, res, () => req.get('authorization') === 'Bearer viewer' ? res.status(403).json({ error: 'read only user' }) : next());
-  registerIncidentRoutes(app, { pool, requireUser, requireEditor }); setupSwagger(app);
+  registerIncidentRoutes(app, { pool, requireUser, requireIncidentEditor: requireEditor }); setupSwagger(app);
   server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.on('listening', resolve));
   base = `http://127.0.0.1:${server.address().port}`;
 });
