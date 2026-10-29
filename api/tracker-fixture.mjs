@@ -99,7 +99,7 @@ const fixtureItsm = {
         {id:1,action:'create',created_at:'2026-10-26T10:50:46Z',created_by:{name:'Заявитель'},changes:{subject:[null,record.subject],status:[null,'assigned']}},
       ]),
       affected_slas:{...section('Показатели SLA'),complete:false,error:'МосИТСМ не разрешил чтение этого раздела',upstream_status:401},
-      note_attachments:section('Вложения',[{id:1,file_name:'Описание.txt',download_url:'https://example.invalid/description.txt'}]),
+      note_attachments:section('Вложения',[{id:1,file_name:'Описание.txt',download_url:'https://example.invalid/description.txt',uri:'https://example.invalid/image.png?expiration=1793385034&signature=fixture-only',unsafe_uri:'javascript:alert(1)'}]),
       cis:section('Оборудование',[{id:100,name:'Тестовая конфигурация',status:'in_progress'}]),
     }};
   },

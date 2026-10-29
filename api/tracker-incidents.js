@@ -71,6 +71,15 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireIncident
     if (!row) fail('Инцидент не найден', 404);
     return row;
   };
+  app.patch('/incidents/:id/comment', requireIncidentEditor, handler(async (req, res) => {
+    if (!req.body || Array.isArray(req.body) || Object.keys(req.body).some(key => !['comment','version'].includes(key))
+      || typeof req.body.comment !== 'string' || req.body.comment.length > 10000
+      || !Number.isInteger(req.body.version) || req.body.version < 1) fail('Укажите комментарий до 10000 символов и версию инцидента');
+    const result = await pool.query(`UPDATE incidents SET comment=$1,updated_by=$2,updated_at=now(),version=version+1
+      WHERE id=$3 AND version=$4 RETURNING *`, [req.body.comment,req.user.id,positiveId(req.params.id),req.body.version]);
+    if (!result.rows.length) { await localIncident(req.params.id); fail('Инцидент уже изменён. Комментарий не сохранён', 409); }
+    res.set('Cache-Control', 'private, no-store').json(result.rows[0]);
+  }));
   app.get('/incidents/:id/itsm', requireUser, handler(async (req, res) => {
     if (!req.user) fail('Нужна пользовательская сессия', 401);
     res.set('Cache-Control', 'private, no-store');

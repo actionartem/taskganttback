@@ -85,6 +85,25 @@ test('local comments round trip, reject oversized values and survive legacy clie
   assert.equal((await call('/incidents','POST',{...input,number:'999',comment:'x'.repeat(10001)})).status,400);
   const cleared=await call(`/incidents/${incident.id}`,'PATCH',{...input,comment:'',version:2}); assert.equal(cleared.status,200); assert.equal((await cleared.json()).comment,'');
 });
+
+test('inline comments change only text and version, preserve monitor/closure state and reject stale writes', async () => {
+  const incident=await create();
+  const path=`/incidents/${incident.id}/comment`;
+  const body={comment:'Текст прямо из таблицы\nС новой строки',version:incident.version};
+  assert.equal((await call(path,'PATCH',body,null)).status,401);
+  assert.equal((await call(path,'PATCH',body,'viewer')).status,403);
+  for(const invalid of [{...body,expires_at:NOW.toISOString()},{...body,comment:null},{...body,comment:'x'.repeat(10001)},{comment:'Без версии'},[]]) assert.equal((await call(path,'PATCH',invalid)).status,400);
+  await pool.query('UPDATE incidents SET itsm_deadline_at=$1,next_check_at=$1,check_error=$2 WHERE id=$3',['2026-11-02T13:21:00Z','Контрольный статус проверки',incident.id]);
+  const before=JSON.parse(JSON.stringify(await row(incident.id))), response=await call(path,'PATCH',body); assert.equal(response.status,200);
+  const saved=await response.json(); assert.equal(saved.comment,body.comment); assert.equal(saved.version,2);
+  for(const key of ['number','jira_url','priority','expires_at','is_deferred','deferred_until','itsm_deadline_at','next_check_at','check_error','status','closed_at','closure_source']) assert.deepEqual(saved[key],before[key]);
+  assert.equal((await call(path,'PATCH',{...body,comment:'Устаревшая правка'})).status,409);
+  assert.equal((await row(incident.id)).comment,body.comment);
+  const archived=await (await call(`/incidents/${incident.id}/close`,'POST',{status:'burned',version:2})).json();
+  const edited=await (await call(path,'PATCH',{comment:'',version:archived.version})).json();
+  assert.equal(edited.comment,''); assert.equal(edited.status,'burned'); assert.equal(edited.closure_source,'manual'); assert.equal(edited.closed_at,archived.closed_at); assert.equal(edited.next_check_at,null);
+  assert.equal((await call('/incidents/999999/comment','PATCH',body)).status,404);
+});
 test('details are readable, sync is editor-only, fresh on every press and never changes Jira or comment', async () => {
   const incident=await create();
   assert.equal((await call(`/incidents/${incident.id}/itsm`,'GET',null,null)).status,401);

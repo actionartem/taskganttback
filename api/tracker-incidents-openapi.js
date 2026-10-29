@@ -42,6 +42,11 @@ export function extendIncidentsSpec(spec) {
     summary: 'Свежие сведения МосИТСМ: карточка и все страницы доступных разделов', security, parameters: [id],
     responses: { ...responses, 200: { description: 'record, sections (items/complete/error/upstream_status), checked_at, incident_version, synchronization (values/error)' }, 502: { description: 'Ошибка МосИТСМ' }, 503: { description: 'На сервере не настроен MOS_ITSM_TOKEN' }, 504: { description: 'Истекло время ожидания' } },
   } };
+  spec.paths['/incidents/{id}/comment'] = { patch: {
+    summary: 'Изменить только локальный комментарий с проверкой версии', security, parameters: [id],
+    requestBody: body({ type: 'object', additionalProperties: false, required: ['comment','version'], properties: { comment: input.properties.comment, version: input.properties.version } }),
+    responses: { ...responses, 200: { description: 'Комментарий сохранён; сроки, результат и состояние автоматической проверки не меняются', content: content({ $ref: '#/components/schemas/Incident' }) } },
+  } };
   spec.paths['/incidents/{id}/itsm/sync'] = { post: {
     summary: 'Повторно прочитать МосИТСМ и атомарно обновить только приоритет, срок решения и ожидание', security, parameters: [id],
     requestBody: body({ type: 'object', additionalProperties: false, required: ['version'], properties: { version: input.properties.version } }),
