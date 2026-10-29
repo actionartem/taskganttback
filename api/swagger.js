@@ -1,6 +1,7 @@
 import swaggerUi from "swagger-ui-express";
 import swaggerJSDoc from "swagger-jsdoc";
 import { extendTrackerSpec } from './tracker-openapi.js';
+import { extendIncidentsSpec } from './tracker-incidents-openapi.js';
 
 const authSecurity = [{ bearerAuth: [] }, { sessionCookie: [] }];
 const internalSecurity = [{ internalToken: [] }];
@@ -685,6 +686,7 @@ export function setupSwagger(app) {
   };
 
   extendTrackerSpec(options.definition);
+  extendIncidentsSpec(options.definition);
   const swaggerSpec = swaggerJSDoc(options);
   app.get('/openapi.json', (req,res) => res.json(swaggerSpec));
   app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));

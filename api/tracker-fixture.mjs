@@ -9,15 +9,24 @@ import {saveJiraSnapshot} from './tracker-jira.js';
 import {saveAzSnapshot,saveAnalysisMail} from './tracker-analysis.js';
 import {validateDocument,insertDocument,validateApprovedDocument,replaceApprovedDocument} from './tracker-documents.js';
 import {registerTrackerRoutes,handler} from './tracker-routes.js';
+import {registerIncidentRoutes} from './tracker-incidents.js';
 import {setupSwagger} from './swagger.js';
 const db=new PGlite();
 const source=await fs.readFile(new URL('./tracker.test.js',import.meta.url),'utf8');
 const sql=source.match(/await db.exec\(`([\s\S]*?)`\);/)[1];
 await db.exec(sql);await db.exec(await fs.readFile(new URL('../migrations/20261026_tracker_v2.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8'));
+await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents.sql',import.meta.url),'utf8'));
 const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows??r.rows.length}};
 const pool={query,connect:async()=>({query,release(){}})};
 const user={id:'1',name:'Тестовый руководитель',login:'test',is_superadmin:true,token:'local-fixture-only'};
+for (const [number,priority,expires,deferred] of [
+  ['INC-1042','high','2026-10-29T18:00:00+03:00',null],
+  ['INC-1043','medium','2026-10-29T19:30:00+03:00','2026-11-02T12:00:00+03:00'],
+  ['INC-1044','low','2026-10-30T10:00:00+03:00',null],
+  ['INC-1045','high','2026-10-30T15:00:00+03:00',null],
+  ['INC-1046','medium','2026-10-31T23:30:00+03:00','2026-11-03T00:15:00+03:00'],
+]) await pool.query('INSERT INTO incidents(number,jira_url,priority,expires_at,is_deferred,deferred_until) VALUES($1,$2,$3,$4,$5,$6)',[number,`https://jira.example.invalid/browse/${number}`,priority,expires,!!deferred,deferred]);
 const names=['Согласовать описание интеграции с заказчиком','Добавить проверку данных перед выгрузкой отчёта','Разобрать замечания к техническому заданию по обмену данными','Проверить отображение длинных названий на телефоне','Выгрузить сводный перечень задач','Уточнить объём работ по следующему этапу','Сопровождение интеграции и ежемесячная сверка данных с заказчиком'];
 const statuses=['на согласовании','разработка','в аналитике','ревью','завершена','оценка','готова к разработке'];
 for(let i=0;i<21;i++)await transaction(pool,c=>writeTask(c,String(10001+i),{title:names[i%7],status:statuses[i%7],priority:i%3===0?'high':'medium',assignee_user_id:i%4===2?null:'1',start_at:`2026-10-${String(19+i%9).padStart(2,'0')}`,due_at:`2026-${i%3===0?'11':'10'}-${i%3===0?'06':'29'}`,approved_hours:i%3===0?null:(i+1)*8,spent_hours:i%2===0?null:8,tags:i%2?['API']:[]},user,{creating:true}));
@@ -58,5 +67,6 @@ app.patch('/tasks/:id',auth,handler(async(req,res)=>{
   res.json(task);
 }));
 registerTrackerRoutes(app,{pool,requireUser:auth,requireEditor:auth,env:{AGENT_API_TOKEN:'local-agent-only',JIRA_INGEST_TOKEN:'local-jira-only'},startJobs:false});
+registerIncidentRoutes(app,{pool,requireUser:auth,requireEditor:auth});
 setupSwagger(app);
 app.listen(3891,'127.0.0.1',()=>console.log('Synthetic fixture API on 127.0.0.1:3891'));

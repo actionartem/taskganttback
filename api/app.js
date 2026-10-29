@@ -2,6 +2,7 @@
 
 import express from "express";
 import { registerTrackerRoutes } from './tracker-routes.js';
+import { registerIncidentRoutes } from './tracker-incidents.js';
 import { transaction, writeTask, setTaskTag } from './tracker-store.js';
 import { sessionCodec,sessionMatchesUser } from './tracker-session.js';
 import { RequestError } from './tracker-domain.js';
@@ -1103,5 +1104,6 @@ app.delete("/tasks/:id/tags/:tagId", requireEditor, async (req, res) => {
 
 // ==================
 registerTrackerRoutes(app,{pool,requireUser,requireEditor});
+registerIncidentRoutes(app,{pool,requireUser,requireEditor});
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("API listening on port", PORT));
