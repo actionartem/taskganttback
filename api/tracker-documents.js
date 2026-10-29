@@ -84,14 +84,14 @@ export function validateApprovedDocument(body) {
     approved_at: approvedAt, approval_evidence: evidence || "Добавлен как согласованный документ" };
 }
 
-export async function replaceApprovedDocument(client, taskId, eventId, doc) {
+export async function replaceApprovedDocument(client, taskId, eventId, doc, { manualCurrent = false } = {}) {
   // applyExternal holds the task row lock: publication and history are atomic.
   const unknown = (await client.query("SELECT id FROM task_documents WHERE task_id=$1 AND approved_at IS NULL AND approval_evidence IS NOT NULL AND is_current=true", [taskId])).rows;
   const published = (await client.query("SELECT id FROM task_documents WHERE task_id=$1 AND (approved_at IS NOT NULL OR (is_current=true AND approval_evidence IS NOT NULL))", [taskId])).rows;
-  if ((doc.approved_at == null && published.length) || unknown.length)
+  if (!manualCurrent && ((doc.approved_at == null && published.length) || unknown.length))
     fail("Нельзя автоматически упорядочить версии с неизвестной датой согласования; нужна ручная сверка", 409);
   const latest = (await client.query("SELECT max(approved_at) AS approved_at FROM task_documents WHERE task_id=$1", [taskId])).rows[0]?.approved_at;
-  if (latest && new Date(latest) > new Date(doc.approved_at)) fail("У задачи уже есть документ с более поздней датой согласования", 409);
+  if (!manualCurrent && latest && new Date(latest) > new Date(doc.approved_at)) fail("У задачи уже есть документ с более поздней датой согласования", 409);
   await client.query("UPDATE task_documents SET is_current=false WHERE task_id=$1 AND is_current=true", [taskId]);
   return insertDocument(client, taskId, eventId, { ...doc, is_current: true });
 }

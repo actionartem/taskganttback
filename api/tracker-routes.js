@@ -244,7 +244,7 @@ export function registerTrackerRoutes(
       (
         await pool.query(
           req.query.latest === "approved"
-            ? `SELECT DISTINCT ON (task_id) ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) AND (approved_at IS NOT NULL OR (is_current=true AND approval_evidence IS NOT NULL)) ORDER BY task_id,approved_at DESC NULLS LAST,received_at DESC,id DESC`
+            ? `SELECT DISTINCT ON (task_id) ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) AND (approved_at IS NOT NULL OR (is_current=true AND approval_evidence IS NOT NULL)) ORDER BY task_id,is_current DESC,approved_at DESC NULLS LAST,received_at DESC,id DESC`
             : `SELECT ${DOCUMENT_COLUMNS} FROM task_documents WHERE ($1::bigint IS NULL OR task_id=$1) ORDER BY received_at DESC,id DESC`,
           [taskId],
         )
@@ -256,10 +256,13 @@ export function registerTrackerRoutes(
   app.get("/integrations/agent/tasks/:id/documents", agent, documentRead);
   const approvedDocumentWrite = handler(async (req, res) => {
     if (req.body.changes !== undefined) fail("Маршрут документа не изменяет поля задачи");
+    if (req.body.replace_current !== undefined && typeof req.body.replace_current !== "boolean") fail("replace_current должен быть boolean");
+    const manualCurrent = req.body.replace_current === true;
+    if (manualCurrent && !req.user) fail("Выбрать актуальный документ вручную может только пользователь-редактор", 403);
     const event = eventFor(req), taskId = positiveId(req.params.id);
     if (event.type !== "document.approved") fail("Ожидается событие document.approved");
     const doc = validateApprovedDocument(req.body.document);
-    const result = await applyExternal(pool, taskId, event, null, { ...doc, file_bytes: undefined }, async (client, r) => ({ document: await replaceApprovedDocument(client, taskId, r.event.id, doc) }), requireApprovedDocumentWrite);
+    const result = await applyExternal(pool, taskId, event, null, { ...doc, file_bytes: undefined, ...(manualCurrent ? { replace_current: true } : {}) }, async (client, r) => ({ document: await replaceApprovedDocument(client, taskId, r.event.id, doc, { manualCurrent }) }), requireApprovedDocumentWrite);
     if (result.duplicate) result.document = (await pool.query(`SELECT ${DOCUMENT_COLUMNS} FROM task_documents WHERE event_id=$1`, [result.event.id])).rows[0];
     res.status(result.duplicate ? 200 : 201).json(result);
   });

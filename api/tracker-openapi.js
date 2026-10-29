@@ -152,7 +152,7 @@ export function extendTrackerSpec(definition) {
       properties: {
         title: { type: "string" },
         approved_at: { type: "string", format: "date-time", nullable: true, description: "Подтверждённая дата согласования, не в будущем; не подставлять дату загрузки" },
-        approval_date_unknown: { type: "boolean", description: "Согласование подтверждено, но дата неизвестна. Нужен approval_evidence; допускается только первоначальная публикация без замены существующего согласованного документа." },
+        approval_date_unknown: { type: "boolean", description: "Согласование подтверждено, но дата неизвестна. Нужен approval_evidence. Для интеграций допускается только первоначальная публикация; пользователь-редактор может явно выбрать актуальный документ через replace_current." },
         approval_evidence: { type: "string" },
         version: { type: "string", description: "Необязательный идентификатор версии источника" },
         source_url: { type: "string", format: "uri", nullable: true },
@@ -341,6 +341,14 @@ export function extendTrackerSpec(definition) {
       Object.entries(ops).map(([method, op]) => [method, { ...op, security }]),
     );
   }
+  const manualApproved = definition.paths["/tasks/{id}/documents/approved"].post;
+  manualApproved.summary = "Явно выбрать актуальный согласованный документ без обязательной даты";
+  manualApproved.requestBody = { required: true, content: json({
+    type: "object", required: ["event", "document"], properties: {
+      event: ref("ExternalEvent"), document: ref("ApprovedDocumentInput"),
+      replace_current: { type: "boolean", description: "Только пользователь-редактор: явно заменить актуальный документ, в том числе без даты согласования. Не доступно токенам интеграций." },
+    },
+  }) };
   definition.paths["/tasks/{id}"].get = operation(
     "Прочитать задачу с отдельным Jira-снимком",
     null,

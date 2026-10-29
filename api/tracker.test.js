@@ -368,3 +368,30 @@ test('DOCM original is supported without renaming; misleading content remains re
   assert.equal(doc.file_name,'original.docm');assert.equal(doc.mime_type,'application/vnd.ms-word.document.macroEnabled.12');assert.deepEqual(doc.file_bytes,bytes);
   assert.throws(()=>validateDocument({kind:'az',title:'bad',version:'1',file_name:'fake.docm',file_base64:Buffer.from('not a package').toString('base64')}),e=>e.status===400);
 });
+
+test('manual current document replaces dated or undated versions without inventing approval time; agents cannot force it',async()=>{
+  const id='40003';
+  await transaction(pool,c=>writeTask(c,id,{title:'Manual current approved document',status:'готова к разработке'},{id:'1'},{creating:true}));
+  const post=async(body,agent=false)=>fetch(`${base}/${agent?'integrations/agent/':''}tasks/${id}/documents/approved`,{method:'POST',headers:{'Content-Type':'application/json',...(agent?{'x-integration-token':'test-agent'}:{Authorization:'Bearer test-user'})},body:JSON.stringify(body)});
+  const event=(external_id)=>({external_id,type:'document.approved',summary:'Пользователь выбрал актуальный согласованный документ'});
+  const dated={event:event('manual-dated-original'),document:{title:'Original',approved_at:'2026-10-25T10:00:00Z',source_url:'https://example.test/original'}};
+  const first=await post(dated);assert.equal(first.status,201);
+  const manual={replace_current:true,event:event('manual-unknown-current'),document:{title:'Current without date',approved_at:null,approval_date_unknown:true,approval_evidence:'Явно выбран пользователем как актуальный согласованный',source_url:'https://example.test/current'}};
+  assert.equal((await post(manual,true)).status,403);
+  assert.equal((await post({...manual,replace_current:'yes'})).status,400);
+  assert.equal((await post({...manual,replace_current:false})).status,409);
+  const saved=await post(manual);assert.equal(saved.status,201);const current=(await saved.json()).document;
+  assert.equal(current.approved_at,null);assert.equal(current.is_current,true);
+  const read=async()=>await(await fetch(`${base}/tasks/${id}/documents?latest=approved`,{headers:{Authorization:'Bearer test-user'}})).json();
+  assert.equal((await read())[0].id,current.id);
+  const listed=await(await fetch(`${base}/documents?latest=approved`,{headers:{Authorization:'Bearer test-user'}})).json();
+  assert.equal(listed.find(doc=>String(doc.task_id)===id).id,current.id);
+  assert.equal((await post({...dated,event:event('agent-must-not-replace-manual')},true)).status,409);
+  const second={...manual,event:event('manual-next-current'),document:{...manual.document,title:'Next current',source_url:'https://example.test/next-current'}};
+  const next=await post(second);assert.equal(next.status,201);const nextDoc=(await next.json()).document;
+  assert.equal((await post(manual)).status,200);
+  assert.equal((await read())[0].id,nextDoc.id);
+  const versions=await pool.query('SELECT id,is_current,approved_at FROM task_documents WHERE task_id=$1',[id]);
+  assert.equal(versions.rows.length,3);assert.equal(versions.rows.filter(doc=>doc.is_current).length,1);
+  await pool.query('DELETE FROM tasks WHERE id=$1',[id]);
+});
