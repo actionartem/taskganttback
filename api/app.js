@@ -1,6 +1,7 @@
 // SimpleTracker API. Transactional history and agent routes live in tracker-*.js.
 
 import express from "express";
+import { registerItsmRelayRoutes } from './tracker-itsm-relay.js';
 import { registerTrackerRoutes } from './tracker-routes.js';
 import { registerIncidentRoutes } from './tracker-incidents.js';
 import { createUserAuthenticator, permissionGuard } from './tracker-permissions.js';
@@ -18,6 +19,7 @@ import ExcelJS from "exceljs";
 
 const { Pool } = pkg;
 const app = express();
+registerItsmRelayRoutes(app);
 
 app.use(['/tasks/:id/documents','/integrations/agent/tasks/:id/documents'], express.json({limit:'15mb'}));
 app.use(['/tasks','/integrations/agent','/integrations/jira'], express.json({limit:'1mb'}));

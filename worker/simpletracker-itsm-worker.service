@@ -1,0 +1,25 @@
+[Unit]
+Description=SimpleTracker MOS ITSM outbound read-only worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/simpletracker-itsm-worker/venv/bin/python %h/.local/share/simpletracker-itsm-worker/worker.py
+Environment=ITSM_WORKER_VAULT=%h/.local/share/simpletracker-itsm-worker/credentials.vault
+LoadCredential=relay-vault-key:%h/.config/simpletracker-itsm-worker/vault.key
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,4 +1,5 @@
 import { fail, RequestError } from './tracker-domain.js';
+import { itsmRelay } from './tracker-itsm-relay.js';
 
 const ORIGIN = 'https://api.itsm.mos.ru';
 export const ITSM_SECTIONS = {
@@ -13,18 +14,21 @@ const remoteError = (status) => status === 404 ? 'Инцидент не найд
   : status === 429 ? 'МосИТСМ ограничил частоту запросов. Повторите позже'
   : 'МосИТСМ временно не отвечает';
 
-export function createItsmClient({ token = process.env.MOS_ITSM_TOKEN, fetchImpl = fetch, timeoutMs = 12000, overallMs = 60000, maxPages = 100, maxBytes = 32 * 1024 * 1024 } = {}) {
+export function createItsmClient({ token = process.env.MOS_ITSM_TOKEN, fetchImpl = fetch, timeoutMs = 12000, overallMs = 60000, maxPages = 100, maxBytes = 32 * 1024 * 1024, transport = process.env.MOS_ITSM_TRANSPORT || 'direct', relay = itsmRelay } = {}) {
+  const relayed = transport === 'relay';
+  if (!['direct','relay'].includes(transport)) throw new Error('Invalid MOS_ITSM_TRANSPORT');
+  const configured = relayed ? relay.configured : Boolean(token);
   async function json(url, signal, budget) {
-    if (!token) fail('Подключение к МосИТСМ ещё не настроено на сервере', 503);
+    if (!configured) fail('Подключение к МосИТСМ ещё не настроено на сервере', 503);
     if (signal.aborted) fail('Загрузка МосИТСМ отменена или превысила время ожидания', 504);
     if (++budget.requests > 250 || budget.bytes > maxBytes) fail('Достигнут предел объёма загрузки МосИТСМ; раздел получен не полностью', 502);
     let response;
     try {
-      response = await fetchImpl(url, { method: 'GET', redirect: 'error', cache: 'no-store',
+      response = relayed ? await relay.fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) }) : await fetchImpl(url, { method: 'GET', redirect: 'error', cache: 'no-store',
         headers: { Authorization: `Bearer ${token}`, 'X-4me-Account': 'echd', Accept: 'application/json', 'Cache-Control': 'no-cache' },
         signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
       });
-    } catch { fail('Не удалось дождаться ответа МосИТСМ', 504); }
+    } catch (error) { if (error instanceof RequestError) throw error; fail('Не удалось дождаться ответа МосИТСМ', 504); }
     if (!response.ok) {
       const error = new RequestError(response.status === 404 ? 404 : 502, remoteError(response.status));
       error.upstreamStatus = response.status;
@@ -74,7 +78,7 @@ export function createItsmClient({ token = process.env.MOS_ITSM_TOKEN, fetchImpl
     }
   }
   return {
-    configured: Boolean(token),
+    configured,
     record,
     async details(number, callerSignal) {
       const timeout = AbortSignal.timeout(overallMs), signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;

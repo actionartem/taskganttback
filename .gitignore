@@ -24,3 +24,10 @@ simpletracker.dump
 *.sql
 !migrations/
 !migrations/*.sql
+
+# Laptop worker runtime and encrypted credentials
+__pycache__/
+*.pyc
+.venv/
+*.vault
+vault.key
