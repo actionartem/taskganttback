@@ -104,6 +104,37 @@ test('inline comments change only text and version, preserve monitor/closure sta
   assert.equal(edited.comment,''); assert.equal(edited.status,'burned'); assert.equal(edited.closure_source,'manual'); assert.equal(edited.closed_at,archived.closed_at); assert.equal(edited.next_check_at,null);
   assert.equal((await call('/incidents/999999/comment','PATCH',body)).status,404);
 });
+test('inline priority and timing patches validate atomically, require editor access and preserve unrelated fields', async () => {
+  const incident=await create(), path=`/incidents/${incident.id}/fields`;
+  const patch={priority:'medium',version:1};
+  assert.equal((await call(path,'PATCH',patch,null)).status,401);
+  assert.equal((await call(path,'PATCH',patch,'viewer')).status,403);
+  for(const body of [{version:1},{...patch,comment:'Не менять'},{...patch,status:'completed'},{...patch,priority:'unknown'},{version:1,is_deferred:true},{version:1,expires_at:'2026-02-30T10:00:00Z'}]) assert.equal((await call(path,'PATCH',body)).status,400);
+  await pool.query('UPDATE incidents SET itsm_deadline_at=$1,next_check_at=$1 WHERE id=$2',['2026-11-02T13:21:00Z',incident.id]);
+  const before=JSON.parse(JSON.stringify(await row(incident.id)));
+  const priorityResponse=await call(path,'PATCH',patch); assert.equal(priorityResponse.status,200);
+  const priority=await priorityResponse.json(); assert.equal(priority.priority,'medium'); assert.equal(priority.version,2);
+  for(const key of ['number','jira_url','comment','expires_at','is_deferred','deferred_until','itsm_deadline_at','next_check_at','status','closed_at']) assert.deepEqual(priority[key],before[key]);
+  assert.equal((await call(path,'PATCH',{priority:'low',version:1})).status,409);
+  const timingResponse=await call(path,'PATCH',{expires_at:'2026-10-30T15:00:00+03:00',is_deferred:true,deferred_until:'2026-11-02T12:00:00+03:00',version:2});
+  assert.equal(timingResponse.status,200); const timing=await timingResponse.json();
+  assert.equal(timing.expires_at,'2026-10-30T12:00:00.000Z'); assert.equal(timing.is_deferred,true); assert.equal(timing.deferred_until,'2026-11-02T09:00:00.000Z');
+  assert.equal(timing.itsm_deadline_at,null); assert.ok(timing.next_check_at); assert.equal(timing.comment,input.comment); assert.equal(timing.jira_url,input.jira_url);
+  assert.equal((await call(path,'PATCH',{expires_at:'2026-11-03T12:00:00Z',version:3})).status,400);
+  assert.equal((await row(incident.id)).version,3);
+  const cleared=await (await call(path,'PATCH',{is_deferred:false,deferred_until:null,version:3})).json(); assert.equal(cleared.is_deferred,false); assert.equal(cleared.deferred_until,null);
+  assert.equal((await call('/incidents/999999/fields','PATCH',patch)).status,404);
+});
+
+test('inline archive edits never reopen records or change the stored closure outcome', async () => {
+  const incident=await create();
+  const closed=await (await call(`/incidents/${incident.id}/close`,'POST',{status:'completed',version:1})).json();
+  const response=await call(`/incidents/${incident.id}/fields`,'PATCH',{priority:'low',expires_at:'2026-11-02T10:00:00Z',version:closed.version}); assert.equal(response.status,200);
+  const edited=await response.json();
+  for(const key of ['status','closed_at','closure_source','closure_deadline_at','next_check_at']) assert.deepEqual(edited[key],closed[key]);
+  assert.equal(edited.comment,input.comment);
+});
+
 test('details are readable, sync is editor-only, fresh on every press and never changes Jira or comment', async () => {
   const incident=await create();
   assert.equal((await call(`/incidents/${incident.id}/itsm`,'GET',null,null)).status,401);

@@ -80,6 +80,30 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireIncident
     if (!result.rows.length) { await localIncident(req.params.id); fail('Инцидент уже изменён. Комментарий не сохранён', 409); }
     res.set('Cache-Control', 'private, no-store').json(result.rows[0]);
   }));
+  app.patch('/incidents/:id/fields', requireIncidentEditor, handler(async (req, res) => {
+    const editable = new Set(['priority','expires_at','is_deferred','deferred_until']);
+    if (!req.body || Array.isArray(req.body) || Object.keys(req.body).some(key => key !== 'version' && !editable.has(key))
+      || !Number.isInteger(req.body.version) || req.body.version < 1) fail('Укажите изменяемые поля и версию инцидента');
+    const keys = Object.keys(req.body).filter(key => editable.has(key));
+    if (!keys.length) fail('Укажите хотя бы одно изменяемое поле');
+    const current = await localIncident(req.params.id);
+    if (current.version !== req.body.version) fail('Инцидент уже изменён. Повторите правку', 409);
+    const base = { number: current.number, jira_url: current.jira_url, priority: current.priority,
+      expires_at: new Date(current.expires_at).toISOString(), is_deferred: current.is_deferred,
+      deferred_until: current.deferred_until ? new Date(current.deferred_until).toISOString() : null };
+    const input = validateIncident({ ...base, ...req.body }, { updating: true });
+    const timingChanged = keys.some(key => key !== 'priority' && base[key] !== input[key]);
+    const values = keys.map(key => input[key]);
+    const assignments = keys.map((key, index) => `${key}=$${index + 1}`);
+    values.push(req.user.id, timingChanged, current.id, current.version);
+    const actor = keys.length + 1, timing = actor + 1, id = timing + 1, version = id + 1;
+    const result = await pool.query(`UPDATE incidents SET ${assignments.join(',')},updated_by=$${actor},updated_at=now(),version=version+1,
+      next_check_at=CASE WHEN $${timing} THEN CASE WHEN status='active' THEN now() ELSE NULL END ELSE next_check_at END,
+      itsm_deadline_at=CASE WHEN $${timing} THEN NULL ELSE itsm_deadline_at END
+      WHERE id=$${id} AND version=$${version} RETURNING *`, values);
+    if (!result.rows.length) fail('Инцидент изменён во время сохранения. Повторите правку', 409);
+    res.set('Cache-Control', 'private, no-store').json(result.rows[0]);
+  }));
   app.get('/incidents/:id/itsm', requireUser, handler(async (req, res) => {
     if (!req.user) fail('Нужна пользовательская сессия', 401);
     res.set('Cache-Control', 'private, no-store');

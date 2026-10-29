@@ -47,6 +47,14 @@ export function extendIncidentsSpec(spec) {
     requestBody: body({ type: 'object', additionalProperties: false, required: ['comment','version'], properties: { comment: input.properties.comment, version: input.properties.version } }),
     responses: { ...responses, 200: { description: 'Комментарий сохранён; сроки, результат и состояние автоматической проверки не меняются', content: content({ $ref: '#/components/schemas/Incident' }) } },
   } };
+  spec.paths['/incidents/{id}/fields'] = { patch: {
+    summary: 'Изменить приоритет или сроки прямо в таблице, сохранив остальные поля', security, parameters: [id],
+    requestBody: body({ type: 'object', additionalProperties: false, minProperties: 2, required: ['version'], properties: {
+      priority: input.properties.priority, expires_at: input.properties.expires_at, is_deferred: input.properties.is_deferred,
+      deferred_until: input.properties.deferred_until, version: input.properties.version,
+    } }),
+    responses: { ...responses, 200: { description: 'Обновлены только переданные поля. Изменение сроков планирует повторную проверку активного инцидента; результат архива сохраняется', content: content({ $ref: '#/components/schemas/Incident' }) } },
+  } };
   spec.paths['/incidents/{id}/itsm/sync'] = { post: {
     summary: 'Повторно прочитать МосИТСМ и атомарно обновить только приоритет, срок решения и ожидание', security, parameters: [id],
     requestBody: body({ type: 'object', additionalProperties: false, required: ['version'], properties: { version: input.properties.version } }),
