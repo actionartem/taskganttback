@@ -13,6 +13,8 @@ before(async () => {
   await db.exec('CREATE TABLE users(id BIGSERIAL PRIMARY KEY); INSERT INTO users DEFAULT VALUES; CREATE TABLE tasks(id bigint PRIMARY KEY); INSERT INTO tasks VALUES(42);');
   const migration = await fs.readFile(new URL('../migrations/20261029_incidents.sql', import.meta.url), 'utf8');
   await db.exec(migration); await db.exec(migration);
+  const comments = await fs.readFile(new URL('../migrations/20261029_incident_itsm.sql', import.meta.url), 'utf8');
+  await db.exec(comments); await db.exec(comments);
   pool = { query: async (sql, params) => db.query(sql, params) };
   const app = express(); app.use(express.json());
   const requireUser = (req, res, next) => {

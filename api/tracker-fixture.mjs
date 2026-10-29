@@ -18,6 +18,7 @@ const sql=source.match(/await db.exec\(`([\s\S]*?)`\);/)[1];
 await db.exec(sql);await db.exec(await fs.readFile(new URL('../migrations/20261026_tracker_v2.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents.sql',import.meta.url),'utf8'));
+await db.exec(await fs.readFile(new URL('../migrations/20261029_incident_itsm.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_user_access_roles.sql',import.meta.url),'utf8'));
 const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows??r.rows.length}};
 const pool={query,connect:async()=>({query,release(){}})};
@@ -31,6 +32,9 @@ for (const [number,priority,expires,deferred] of [
   ['INC-1045','high','2026-10-30T15:00:00+03:00',null],
   ['INC-1046','medium','2026-10-31T23:30:00+03:00','2026-11-03T00:15:00+03:00'],
 ]) await pool.query('INSERT INTO incidents(number,jira_url,priority,expires_at,is_deferred,deferred_until) VALUES($1,$2,$3,$4,$5,$6)',[number,`https://jira.example.invalid/browse/${number}`,priority,expires,!!deferred,deferred]);
+await pool.query("UPDATE incidents SET comment='Ожидаем подтверждение от ответственного. Проверить после выпуска исправления.' WHERE number='INC-1042'");
+for (const [number,status] of [['INC-9001','completed'],['INC-9002','burned']]) await pool.query(`INSERT INTO incidents(number,jira_url,priority,expires_at,status,closed_at,closure_source,comment)
+  VALUES($1,$2,'low','2026-10-26T12:00:00Z',$3,'2026-10-26T13:00:00Z','manual','Тестовая архивная запись')`,[number,`https://jira.example.invalid/browse/${number}`,status]);
 const names=['Согласовать описание интеграции с заказчиком','Добавить проверку данных перед выгрузкой отчёта','Разобрать замечания к техническому заданию по обмену данными','Проверить отображение длинных названий на телефоне','Выгрузить сводный перечень задач','Уточнить объём работ по следующему этапу','Сопровождение интеграции и ежемесячная сверка данных с заказчиком'];
 const statuses=['на согласовании','разработка','в аналитике','ревью','завершена','оценка','готова к разработке'];
 for(let i=0;i<21;i++)await transaction(pool,c=>writeTask(c,String(10001+i),{title:names[i%7],status:statuses[i%7],priority:i%3===0?'high':'medium',assignee_user_id:i%4===2?null:'1',start_at:`2026-10-${String(19+i%9).padStart(2,'0')}`,due_at:`2026-${i%3===0?'11':'10'}-${i%3===0?'06':'29'}`,approved_hours:i%3===0?null:(i+1)*8,spent_hours:i%2===0?null:8,tags:i%2?['API']:[]},user,{creating:true}));
@@ -73,6 +77,33 @@ app.patch('/tasks/:id',editor,handler(async(req,res)=>{
   res.json(task);
 }));
 registerTrackerRoutes(app,{pool,requireUser:auth,requireEditor:editor,env:{AGENT_API_TOKEN:'local-agent-only',JIRA_INGEST_TOKEN:'local-jira-only'},startJobs:false});
-registerIncidentRoutes(app,{pool,requireUser:auth,requireIncidentEditor:incidentEditor});
+const fixtureRecord = number => ({ id: number, subject:'Проверка интеграции: актуальная информация об инциденте', status:'waiting_for', impact:'low',
+  created_at:'2026-10-26T10:50:46Z',updated_at:new Date().toISOString(),member:{id:41,name:'Тестовый исполнитель',account:{id:'fixture',name:'Тестовое пространство'}},team:{id:1,name:'Группа поддержки'},
+  service_instance:{id:1,name:'Технологический портал'},resolution_target_at:'2026-11-04T10:50:00Z',next_target_at:'2026-11-04T10:50:00Z',waiting_until:'2026-11-06T13:21:00Z',completed_at:null,
+  requester_resolution_target_at:'2026-11-04T10:50:00Z',custom_fields:{source:'Синтетические данные',checks:{html:true,files:true}},urgent:false,source:'Тестовый стенд',tags:[],
+});
+const fixtureItsm = {
+  record: async number => fixtureRecord(number),
+  details: async number => {
+    await new Promise(resolve=>setTimeout(resolve,700));
+    const record=fixtureRecord(number);
+    const section=(title,items=[])=>({title,items,complete:true,error:null,upstream_status:null});
+    return {record,checked_at:new Date().toISOString(),sections:{
+      notes:section('Комментарии и заметки',[
+        {id:1,created_at:'2026-10-26T10:50:46Z',person:{name:'Заявитель'},internal:false,text:'Добрый день!\n\n**Описание обращения**\n\nПосле перехода между разделами остаётся ссылка от предыдущего заказа.\n\n1. Открыть очередь заказов\n2. Переключить тип заказа\n\nНужна проверка и исправление.\n\n<details><summary>Окружение</summary>Тестовый технологический портал</details>',attachments:[{id:1,file_name:'Описание.txt',download_url:'https://example.invalid/description.txt'}]},
+        {id:2,created_at:'2026-10-28T14:00:00Z',person:{name:'Исполнитель'},internal:true,text:'Исправление готово.\n\n| Проверка | Результат |\n| --- | --- |\n| Переход в массовые заказы | Исправлено |\n\n<script>alert("unsafe")</script><a href="javascript:alert(1)">Небезопасная ссылка</a><img src="https://example.invalid/tracking.png" onerror="alert(1)">',attachments:[]},
+      ]),
+      audit:section('История изменений',[
+        {id:3,action:'update',created_at:'2026-10-28T14:00:00Z',created_by:{name:'Исполнитель'},changes:{status:['in_progress','waiting_for'],waiting_until:[null,'2026-11-06T13:21:00Z']}},
+        {id:2,action:'update',created_at:'2026-10-26T11:00:00Z',created_by:{name:'Координатор'},changes:{status:['assigned','in_progress'],member:[null,{id:41,name:'Тестовый исполнитель'}]}},
+        {id:1,action:'create',created_at:'2026-10-26T10:50:46Z',created_by:{name:'Заявитель'},changes:{subject:[null,record.subject],status:[null,'assigned']}},
+      ]),
+      affected_slas:{...section('Показатели SLA'),complete:false,error:'МосИТСМ не разрешил чтение этого раздела',upstream_status:401},
+      note_attachments:section('Вложения',[{id:1,file_name:'Описание.txt',download_url:'https://example.invalid/description.txt'}]),
+      cis:section('Оборудование',[{id:100,name:'Тестовая конфигурация',status:'in_progress'}]),
+    }};
+  },
+};
+registerIncidentRoutes(app,{pool,requireUser:auth,requireIncidentEditor:incidentEditor,itsm:fixtureItsm,startJobs:false});
 setupSwagger(app);
 app.listen(3891,'127.0.0.1',()=>console.log('Synthetic fixture API on 127.0.0.1:3891'));
