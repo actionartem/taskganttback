@@ -6,9 +6,10 @@ import { PGlite } from '@electric-sql/pglite';
 import { createItsmClient, incidentSyncFields, ITSM_SECTIONS } from './tracker-itsm.js';
 import { registerIncidentRoutes } from './tracker-incidents.js';
 import { incidentClosureDecision, runIncidentMonitor } from './tracker-incident-monitor.js';
+import { createIncidentCreationLoader, incidentSourceCreatedAt } from './tracker-incident-created.js';
 
 const NOW = new Date('2026-10-29T15:00:00Z');
-const remote = () => ({ id: 27787457, status: 'waiting_for', impact: 'low', resolution_target_at: '2026-10-29T14:00:00Z', waiting_until: '2026-11-02T13:21:00Z', completed_at: null });
+const remote = () => ({ id: 27787457, created_at: '2026-10-20T10:00:00Z', status: 'waiting_for', impact: 'low', resolution_target_at: '2026-10-29T14:00:00Z', waiting_until: '2026-11-02T13:21:00Z', completed_at: null });
 const input = { number: '27787457', jira_url: 'https://jira.example.invalid/browse/MANUAL-42', priority: 'high', expires_at: '2026-10-29T14:59:00Z', is_deferred: false, deferred_until: null, comment: 'Наш комментарий\nВторая строка' };
 let db, pool, server, base, source, recordCalls, recordHook;
 const itsm = {
@@ -17,7 +18,7 @@ const itsm = {
 };
 before(async () => {
   db = new PGlite(); await db.exec('CREATE TABLE users(id BIGSERIAL PRIMARY KEY); INSERT INTO users DEFAULT VALUES;');
-  for (const migration of ['20261029_incidents.sql','20261029_incident_itsm.sql']) {
+  for (const migration of ['20261029_incidents.sql','20261029_incident_itsm.sql','20261029_incidents_created_at.sql']) {
     const sql = await fs.readFile(new URL('../migrations/'+migration, import.meta.url), 'utf8'); await db.exec(sql); await db.exec(sql);
   }
   pool = { query: (sql, params) => db.query(sql, params) };
@@ -35,6 +36,61 @@ after(async () => { await new Promise(resolve => server.close(resolve)); await d
 const call = (path, method = 'GET', body, role = 'editor') => fetch(base+path, { method, headers: { 'Content-Type': 'application/json', ...(role ? { Authorization: `Bearer ${role}` } : {}) }, ...(body ? { body: JSON.stringify(body) } : {}) });
 const create = async (patch = {}) => { const response = await call('/incidents','POST',{ ...input, ...patch }); assert.equal(response.status,201); return response.json(); };
 const row = async id => (await pool.query('SELECT * FROM incidents WHERE id=$1',[id])).rows[0];
+
+test('source creation dates require the matching ITSM number and a real timestamp', () => {
+  assert.equal(incidentSourceCreatedAt(input,{...remote(),created_at:'2026-06-18T17:47:00+03:00'}),'2026-06-18T14:47:00.000Z');
+  for(const record of [{...remote(),id:999},{...remote(),created_at:null},{...remote(),created_at:'2026-02-30T10:00:00Z'},{...remote(),created_at:'2026-06-18'},{...remote(),created_at:'wrong'}]) assert.equal(incidentSourceCreatedAt(input,record),null);
+  assert.equal(incidentSourceCreatedAt({...input,number:'INC-1'},remote()),null);
+});
+
+test('reading details remembers creation time without editing local fields, and renumbering clears it', async () => {
+  const incident=await create();
+  const details=await (await call(`/incidents/${incident.id}/itsm`)).json();
+  assert.equal(details.incident.itsm_created_at,'2026-10-20T10:00:00.000Z');
+  const saved=JSON.parse(JSON.stringify(await row(incident.id)));
+  for(const key of Object.keys(incident).filter(key=>key!=='itsm_created_at')) assert.deepEqual(saved[key],incident[key]);
+  const list=await (await call('/incidents')).json(); assert.equal(list.items[0].itsm_created_at,saved.itsm_created_at);
+  const edit=await (await call(`/incidents/${incident.id}`,'PATCH',{...input,priority:'low',version:1})).json(); assert.equal(edit.itsm_created_at,saved.itsm_created_at);
+  const renumber=await (await call(`/incidents/${incident.id}`,'PATCH',{...input,number:'27787458',version:2})).json(); assert.equal(renumber.itsm_created_at,null);
+  assert.equal((await call(`/incidents/${incident.id}/fields`,'PATCH',{version:3,itsm_created_at:NOW.toISOString()})).status,400);
+});
+
+test('creation-date backfill covers archived records without changing manual closure or polling known dates again', async () => {
+  const incident=await create();
+  const closed=await (await call(`/incidents/${incident.id}/close`,'POST',{status:'burned',version:1})).json();
+  const load=createIncidentCreationLoader({pool,itsm});
+  await load(); await load();
+  const filled=JSON.parse(JSON.stringify(await row(incident.id)));
+  assert.equal(filled.itsm_created_at,'2026-10-20T10:00:00.000Z'); assert.equal(recordCalls,1);
+  for(const key of Object.keys(closed).filter(key=>key!=='itsm_created_at')) assert.deepEqual(filled[key],closed[key]);
+  await runIncidentMonitor({pool,itsm,now:NOW}); assert.equal(recordCalls,1);
+});
+
+test('creation-date backfill bounds requests and retries failures without starving other records', async () => {
+  for(const number of ['100','101','102']) await create({number});
+  let time=+NOW, active=0, maxActive=0;
+  const calls=[];
+  const client={async record(number) {
+    calls.push(number); active++; maxActive=Math.max(maxActive,active);
+    try { await new Promise(resolve=>setImmediate(resolve)); if(number==='102') throw new Error('offline'); return {...remote(),id:+number}; }
+    finally { active--; }
+  }};
+  const load=createIncidentCreationLoader({pool,itsm:client,now:()=>time,batchSize:2});
+  await load(); assert.deepEqual(calls.sort(),['101','102']);
+  await load(); assert.equal(calls.length,3); assert.equal(calls.at(-1),'100');
+  await load(); assert.equal(calls.length,3); assert.ok(maxActive<=2);
+  time+=300001; await load(); assert.equal(calls.length,4); assert.equal(calls.at(-1),'102');
+});
+
+test('creation-date response cannot attach to a renumbered incident or overwrite a concurrent manual closure', async () => {
+  const incident=await create();
+  recordHook=async()=>{recordHook=null; assert.equal((await call(`/incidents/${incident.id}`,'PATCH',{...input,number:'27787458',version:1})).status,200);};
+  await createIncidentCreationLoader({pool,itsm})(); assert.equal((await row(incident.id)).itsm_created_at,null);
+  source={...remote(),id:27787458};
+  recordHook=async()=>{recordHook=null; assert.equal((await call(`/incidents/${incident.id}/close`,'POST',{status:'completed',version:2})).status,200);};
+  await createIncidentCreationLoader({pool,itsm})();
+  const saved=await row(incident.id); assert.equal(saved.status,'completed'); assert.equal(saved.closure_source,'manual'); assert.equal(saved.version,3); assert.equal(saved.next_check_at,null); assert.ok(saved.itsm_created_at);
+});
 
 test('ITSM reads all pages, keeps partial errors separate, uses only fixed-host authenticated GETs', async () => {
   const calls = [];

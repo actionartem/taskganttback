@@ -28,6 +28,7 @@ before(async () => {
   await db.exec("UPDATE users SET access_role='incident_editor' WHERE login='support'");
   await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents.sql', import.meta.url), 'utf8'));
   await db.exec(await fs.readFile(new URL('../migrations/20261029_incident_itsm.sql', import.meta.url), 'utf8'));
+  await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents_created_at.sql', import.meta.url), 'utf8'));
   const query = async (sql, params) => { const result = await db.query(sql, params); return { ...result, rowCount: result.affectedRows ?? result.rows.length } };
   pool = { query };
   codec = sessionCodec('synthetic-local-permissions-test-secret', 3600);

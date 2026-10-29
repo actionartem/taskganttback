@@ -22,6 +22,7 @@ export function extendIncidentsSpec(spec) {
     closed_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true },
     closure_deadline_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true },
     itsm_completed_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true },
+    itsm_created_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true, description: 'Дата создания обращения в МосИТСМ; null, пока источник не прочитан' },
     itsm_deadline_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true },
     last_checked_at: { type: 'string', format: 'date-time', nullable: true, readOnly: true },
     check_error: { type: 'string', nullable: true, readOnly: true },

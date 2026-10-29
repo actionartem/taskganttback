@@ -19,6 +19,7 @@ await db.exec(sql);await db.exec(await fs.readFile(new URL('../migrations/202610
 await db.exec(await fs.readFile(new URL('../migrations/20261027_analysis_cycles.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_incident_itsm.sql',import.meta.url),'utf8'));
+await db.exec(await fs.readFile(new URL('../migrations/20261029_incidents_created_at.sql',import.meta.url),'utf8'));
 await db.exec(await fs.readFile(new URL('../migrations/20261029_user_access_roles.sql',import.meta.url),'utf8'));
 const query=async(sql,params)=>{const r=await db.query(sql,params);return {...r,rowCount:r.affectedRows??r.rows.length}};
 const pool={query,connect:async()=>({query,release(){}})};

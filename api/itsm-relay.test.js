@@ -80,7 +80,7 @@ test('isolated database: relayed synchronization changes only four fields; monit
  const {PGlite}=await import('@electric-sql/pglite');const fs=await import('node:fs/promises');
  const {registerIncidentRoutes}=await import('./tracker-incidents.js');const {runIncidentMonitor}=await import('./tracker-incident-monitor.js');
  const db=new PGlite();await db.exec('CREATE TABLE users(id BIGSERIAL PRIMARY KEY);INSERT INTO users DEFAULT VALUES;');
- for(const name of ['20261029_incidents.sql','20261029_incident_itsm.sql'])await db.exec(await fs.readFile(new URL('../migrations/'+name,import.meta.url),'utf8'));
+ for(const name of ['20261029_incidents.sql','20261029_incident_itsm.sql','20261029_incidents_created_at.sql'])await db.exec(await fs.readFile(new URL('../migrations/'+name,import.meta.url),'utf8'));
  const pool={query:(q,p)=>db.query(q,p)},s=await setup();await s.poll();
  const itsm=createItsmClient({token:'',transport:'relay',relay:s.relay});
  const user=(req,_res,next)=>{req.user={id:'1'};next();};s.app.use(express.json());

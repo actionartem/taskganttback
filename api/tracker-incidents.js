@@ -2,6 +2,7 @@ import { fail, positiveId } from './tracker-domain.js';
 import { handler } from './tracker-routes.js';
 import { createItsmClient, incidentSyncFields, incidentSyncPreview } from './tracker-itsm.js';
 import { startIncidentMonitor } from './tracker-incident-monitor.js';
+import { rememberIncidentCreatedAt, startIncidentCreationLoader } from './tracker-incident-created.js';
 
 const fields = new Set(['number', 'jira_url', 'priority', 'expires_at', 'is_deferred', 'deferred_until', 'comment', 'version']);
 
@@ -57,6 +58,7 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireIncident
     const input = validateIncident(req.body, { updating: true });
     const result = await pool.query(`UPDATE incidents SET
       number=$1,jira_url=$2,priority=$3,expires_at=$4,is_deferred=$5,deferred_until=$6,
+      itsm_created_at=CASE WHEN number IS DISTINCT FROM $1::varchar THEN NULL ELSE itsm_created_at END,
       comment=COALESCE($7,comment),updated_by=$8,updated_at=now(),version=version+1,
       next_check_at=CASE WHEN status='active' THEN now() ELSE NULL END,itsm_deadline_at=NULL WHERE id=$9 AND version=$10 RETURNING *`,
       [...Object.values(input), req.user.id, id, req.body.version]);
@@ -111,6 +113,8 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireIncident
     const controller = new AbortController();
     res.once('close', () => { if (!res.writableEnded) controller.abort(); });
     const details = await itsm.details(incident.number, controller.signal);
+    const created = await rememberIncidentCreatedAt(pool, incident, details.record);
+    if (created) incident.itsm_created_at = created;
     res.json({ ...details, incident, incident_version: incident.version, synchronization: incident.status === 'active' ? incidentSyncPreview(details.record) : { values: null, error: 'Инцидент в архиве. Синхронизация отключена' } });
   }));
   app.post('/incidents/:id/itsm/sync', requireIncidentEditor, handler(async (req, res) => {
@@ -150,5 +154,9 @@ export function registerIncidentRoutes(app, { pool, requireUser, requireIncident
     }
     res.status(204).end();
   }));
-  if (startJobs && itsm.configured) return startIncidentMonitor({ pool, itsm });
+  if (startJobs && itsm.configured) {
+    const stopMonitor = startIncidentMonitor({ pool, itsm });
+    const stopCreationLoader = startIncidentCreationLoader({ pool, itsm });
+    return () => { stopMonitor(); stopCreationLoader(); };
+  }
 }
